@@ -1,0 +1,73 @@
+{
+  "name": "dsh-pure-search",
+  "version": "1.0.0",
+  "description": "Pure local search for DeepSeek Harness: ingest Markdown, TXT, PDF, DOCX, HTML and JSON into workspace/session layered indexes, then retrieve the exact passage with verifiable citations. BM25 by default, optional dense; host-only; offline; no sockets.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "engine/kb_engine.py",
+    "scripts/kb-sync-audit.mjs",
+    "scripts/check-upstream.mjs",
+    "scripts/restore-drill.mjs",
+    "cordis.patch.yml",
+    "docs",
+    "DEVELOPMENT.md",
+    "UPSTREAM-DIFF.md",
+    "README.md",
+    "README.zh.md",
+    "SECURITY.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18",
+    "python": ">=3.9"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.0",
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.6"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek",
+    "harness",
+    "dsh",
+    "search",
+    "local-search",
+    "knowledge-base",
+    "rag",
+    "bm25",
+    "retrieval",
+    "local",
+    "offline",
+    "docx",
+    "html",
+    "json",
+    "pdf",
+    "layered"
+  ],
+  "license": "MIT",
+  "author": "silentlamb05147",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/silentlamb05147/dsh-pure-search.git"
+  },
+  "homepage": "https://github.com/silentlamb05147/dsh-pure-search#readme",
+  "bugs": {
+    "url": "https://github.com/silentlamb05147/dsh-pure-search/issues"
+  },
+  "scripts": {
+    "test": "node test/run-all.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

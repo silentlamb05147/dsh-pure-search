@@ -1,0 +1,2915 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""NDJSON knowledge-base engine for the dsh-pure-search DeepSeek Harness plugin.
+
+The wire contract lives in ``PROTOCOL.md`` next to this file.  In short:
+
+* stdin  -- one JSON request per line (NDJSON, UTF-8, no BOM)
+* stdout -- exactly one JSON response line per request, plus one ``ready``
+  event at startup.  Nothing else may ever be written to stdout.
+* stderr -- human readable logs (also mirrored to ``<kb_root>/engine.log``).
+
+The engine is deliberately dependency free: chunking, BM25 retrieval and the
+NDJSON loop only use the Python standard library.  Dense retrieval is an
+optional best-effort layer on top of ``numpy`` + ``sentence-transformers``;
+it is imported lazily and the engine silently degrades to BM25 when either
+package (or the model) is unavailable.
+
+Python 3.9+ / single file / no third-party imports required.
+"""
+
+from __future__ import annotations
+
+import bisect
+import hashlib
+import heapq
+import importlib.util
+import json
+import math
+import os
+import re
+import sys
+import threading
+import time
+import traceback
+from collections import Counter
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+ENGINE_VERSION = "0.1.0"
+MANIFEST_VERSION = 1
+
+# --- safety / tuning caps -------------------------------------------------
+MAX_FILE_BYTES = 20 * 1024 * 1024          # skip files above 20 MB
+MAX_CHUNK_CHARS = 1200                     # hard upper bound for a chunk
+CHUNK_OVERLAP = 120                        # characters shared by neighbours
+CHUNK_CHARS_MIN = 200                      # per-ingest override floor
+CHUNK_CHARS_MAX = 8000                     # per-ingest override ceiling
+SNIPPET_CHARS = 300                        # search snippet budget
+TOP_K_MAX = 50                             # top_k clamp: 1..50
+TOP_K_DEFAULT = 8
+ASK_TOP_K_DEFAULT = 5
+MAX_CHARS_MIN = 500                        # ask budget clamp: 500..30000
+MAX_CHARS_MAX = 30000
+MAX_CHARS_DEFAULT = 6000
+RRF_K = 60                                 # reciprocal rank fusion constant
+SUPERSEDED_WEIGHT = 0.3                    # score multiplier for status: superseded docs
+
+# --- retrieval constants --------------------------------------------------
+BM25_K1 = 1.2
+BM25_B = 0.75
+BGE_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
+DENSE_MODEL = os.environ.get("KB_LITE_MODEL") or "BAAI/bge-small-zh-v1.5"
+RERANK_MODEL = os.environ.get("KB_LITE_RERANK_MODEL") or "BAAI/bge-reranker-base"
+RERANK_TOP_N = 24
+RERANK_TEXT_CHARS = 480
+RERANK_BLEND = 0.5
+
+# Never let a tool call sit on a Hugging Face download: offline by default, opt in
+# with KB_LITE_ALLOW_DOWNLOAD=1. A local model directory (KB_LITE_MODEL) works either way.
+if (os.environ.get("KB_LITE_ALLOW_DOWNLOAD") or "").strip() not in ("1", "true", "yes", "on"):
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
+# --- on-disk layout -------------------------------------------------------
+MANIFEST_NAME = "manifest.json"
+CHUNKS_NAME = "chunks.jsonl"
+VECTORS_NPY = "vectors.npy"
+VECTORS_JSON = "vectors.json"
+VECTORS_META = "vectors.meta.json"
+LOG_NAME = "engine.log"
+
+SUPPORTED_EXTS = (".md", ".markdown", ".txt", ".pdf", ".docx", ".html", ".htm", ".json")
+MARKDOWN_EXTS = (".md", ".markdown")
+HTML_EXTS = (".html", ".htm")
+JSON_MAX_DEPTH = 8
+JSON_MAX_VALUE_CHARS = 2000
+JSON_MAX_TEXT_CHARS = 2 * 1024 * 1024
+
+_SKIP_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
+    "env", ".tox", ".mypy_cache", ".pytest_cache", ".idea", ".vscode",
+}
+
+
+# --------------------------------------------------------------------------
+# errors and logging
+# --------------------------------------------------------------------------
+class KBError(Exception):
+    """An error that maps onto the protocol's error object."""
+
+    def __init__(self, code: str, message: str) -> None:
+        Exception.__init__(self, message)
+        self.code = code
+        self.message = message
+
+
+def _stderr(level: str, msg: str, **extra: Any) -> None:
+    """Write a diagnostic line to stderr; never raise."""
+    try:
+        line = "[kb-lite %s] %s" % (level, msg)
+        if extra:
+            try:
+                line += " " + json.dumps(extra, ensure_ascii=False, default=str)
+            except Exception:
+                pass
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def log_event(root: Optional[str], level: str, msg: str, **extra: Any) -> None:
+    """Mirror a log line to stderr and to ``<kb_root>/engine.log``.
+
+    Logging must never break a request, so every failure is swallowed.
+    """
+    _stderr(level, msg, **extra)
+    if not root:
+        return
+    try:
+        path = os.path.join(os.path.abspath(root), LOG_NAME)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+        suffix = ""
+        if extra:
+            try:
+                suffix = " " + json.dumps(extra, ensure_ascii=False, default=str)
+            except Exception:
+                suffix = ""
+        with open(path, "a", encoding="utf-8", newline="\n") as handle:
+            handle.write("%s %s %s%s\n" % (stamp, level.upper(), msg, suffix))
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------
+# small helpers: time, modules, paths, ids, io
+# --------------------------------------------------------------------------
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _module_present(name: str) -> bool:
+    """Cheap availability probe: locate a module without importing it."""
+    try:
+        return importlib.util.find_spec(name) is not None
+    except Exception:
+        return False
+
+
+def _display_path(path: str) -> str:
+    """Absolute path with forward slashes (stable across the wire)."""
+    try:
+        return os.path.abspath(path).replace("\\", "/")
+    except Exception:
+        return str(path).replace("\\", "/")
+
+
+def _norm_key(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path)).replace("\\", "/")
+
+
+def _doc_id_for(path: str) -> str:
+    return hashlib.sha1(_norm_key(path).encode("utf-8")).hexdigest()[:16]
+
+
+def _ext(path: str) -> str:
+    return os.path.splitext(path)[1].lower()
+
+
+def _stem(path: str) -> str:
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def _real_root(root: str) -> str:
+    return os.path.realpath(os.path.abspath(root))
+
+
+def _child(root: str, name: str) -> str:
+    """Join a fixed storage file name onto kb_root, refusing escapes."""
+    real_root = _real_root(root)
+    path = os.path.join(real_root, name)
+    parent = os.path.dirname(os.path.realpath(path))
+    if parent != real_root:
+        raise KBError("path_escape", "refusing to write outside kb_root: %r" % (name,))
+    return path
+
+
+def _atomic_write(path: str, data: bytes) -> None:
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    try:
+        with open(tmp, "wb") as handle:
+            handle.write(data)
+            try:
+                handle.flush()
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _read_text_file(path: str) -> str:
+    """Read a text file, tolerating UTF-8 (with/without BOM) and GB18030.
+
+    CRLF/CR line endings are normalised to LF so chunk text and snippets are
+    clean; line numbers are unaffected (one break stays one line).
+    """
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    text = None
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            text = raw.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        text = raw.decode("utf-8", errors="replace")
+    if "\r" in text:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text
+
+
+def _front_matter_status(path: str) -> str:
+    """Read the first 2 KiB and return `status:` from the YAML front matter.
+
+    Returns an empty string when there is no front matter or no status key.
+    Only `.md`/`.markdown` files are worth calling this on; the caller checks
+    the extension so PDFs and plain text are never opened here.
+    """
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
+            head = handle.read(2048)
+    except (OSError, ValueError):
+        return ""
+    if not head.startswith("---"):
+        return ""
+    for line in head.splitlines()[1:]:
+        if line.strip() == "---":
+            break
+        if line.strip().lower().startswith("status:"):
+            return line.split(":", 1)[1].strip().strip("'\"").lower()
+    return ""
+
+
+def _mtime_same(stored: Any, current: float) -> bool:
+    try:
+        return abs(float(stored) - float(current)) <= 1e-5
+    except (TypeError, ValueError):
+        return False
+
+
+def _get_bool(params: Dict[str, Any], key: str, default: bool) -> bool:
+    value = params.get(key, None)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on", "y")
+    if isinstance(value, (int, float)):
+        return bool(value)
+    raise KBError("bad_request", "params.%s must be a boolean" % key)
+
+
+def _max_file_bytes(params: Dict[str, Any]) -> int:
+    """Per-file ingest limit: params.max_file_mb > env KB_LITE_MAX_FILE_MB > 20 MB."""
+    raw = params.get("max_file_mb")
+    if raw is None:
+        raw = os.environ.get("KB_LITE_MAX_FILE_MB")
+    try:
+        mb = int(raw)
+    except (TypeError, ValueError):
+        mb = 20
+    if mb <= 0:
+        mb = 20
+    return mb * 1024 * 1024
+
+
+def _clamp_int(value: Any, default: int, low: int, high: int) -> int:
+    if value is None:
+        number = default
+    elif isinstance(value, bool):
+        raise KBError("bad_request", "expected an integer, got a boolean")
+    elif isinstance(value, int):
+        number = value
+    elif isinstance(value, float):
+        number = int(value)
+    elif isinstance(value, str):
+        try:
+            number = int(value.strip())
+        except (TypeError, ValueError):
+            raise KBError("bad_request", "expected an integer, got %r" % (value,))
+    else:
+        raise KBError("bad_request", "expected an integer, got %r" % (value,))
+    return max(low, min(high, number))
+
+
+def _chunk_cfg(params: Dict[str, Any]) -> Dict[str, int]:
+    """Resolve the per-ingest chunk settings (chars, overlap).
+
+    Defaults are the module constants; `chunk_chars` is clamped to
+    [CHUNK_CHARS_MIN, CHUNK_CHARS_MAX] and the overlap can never exceed half of
+    a chunk, so a neighbouring chunk always advances.
+    """
+    chars = _clamp_int(params.get("chunk_chars"), MAX_CHUNK_CHARS,
+                       CHUNK_CHARS_MIN, CHUNK_CHARS_MAX)
+    max_overlap = max(0, chars // 2)
+    raw_overlap = params.get("chunk_overlap")
+    overlap = CHUNK_OVERLAP if raw_overlap is None else _clamp_int(
+        raw_overlap, CHUNK_OVERLAP, 0, max_overlap)
+    return {"chars": chars, "overlap": min(overlap, max_overlap)}
+
+
+def _require_query(params: Dict[str, Any]) -> str:
+    query = params.get("query")
+    if not isinstance(query, str) or not query.strip():
+        raise KBError("bad_request", "params.query must be a non-empty string")
+    return query
+
+
+def _round_optional(value: Any, digits: int = 6) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return None
+
+
+def _weight_value(value: Any, default: float, minimum: float = 0.0) -> float:
+    """Coerce one weight to a float >= minimum (bad input falls back to default)."""
+    if value is None:
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise KBError("bad_request", "weights must be numbers, got %r" % (value,))
+    if number != number or number in (float("inf"), float("-inf")):
+        raise KBError("bad_request", "weights must be finite numbers")
+    if number < 0.0:
+        raise KBError("bad_request", "weights must be >= 0, got %r" % (value,))
+    return max(minimum, number)
+
+
+def _boost_rules(raw: Any) -> List[Tuple[str, float]]:
+    """Accept {"substr": mult} or [{"pattern": ..., "mult": ...}] -> [(pattern, mult)]."""
+    if raw is None:
+        return []
+    items: List[Tuple[str, float]] = []
+    if isinstance(raw, dict):
+        for key, mult in raw.items():
+            pattern = str(key).strip()
+            if pattern:
+                items.append((pattern, _weight_value(mult, 1.0, 0.0)))
+    elif isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                raise KBError("bad_request", "weights.boost entries must be objects")
+            pattern = str(entry.get("pattern") or "").strip()
+            if pattern:
+                items.append((pattern, _weight_value(entry.get("mult"), 1.0, 0.0)))
+    else:
+        raise KBError("bad_request", "weights.boost must be an object or a list")
+    return items
+
+
+def _boost_for(path: str, rules: Sequence[Tuple[str, float]]) -> Tuple[float, Optional[str]]:
+    """Longest matching pattern wins; no match -> (1.0, None)."""
+    haystack = (path or "").replace("\\", "/").lower()
+    best_mult, best_pattern = 1.0, None
+    for pattern, mult in rules:
+        needle = pattern.replace("\\", "/").lower()
+        if needle and needle in haystack:
+            if best_pattern is None or len(needle) > len(best_pattern):
+                best_mult, best_pattern = mult, pattern
+    return best_mult, best_pattern
+
+
+def _parse_weights(raw: Any) -> Dict[str, Any]:
+    if raw is None:
+        return {"bm25": 1.0, "dense": 1.0, "rrf_k": float(RRF_K), "boost": [],
+                "recency": None, "rerank": None}
+    if not isinstance(raw, dict):
+        raise KBError("bad_request", "params.weights must be an object")
+    return {
+        "bm25": _weight_value(raw.get("bm25"), 1.0),
+        "dense": _weight_value(raw.get("dense"), 1.0),
+        "rrf_k": _weight_value(raw.get("rrf_k"), float(RRF_K), minimum=1.0),
+        "boost": _boost_rules(raw.get("boost")),
+        "recency": _recency_cfg(raw.get("recency")),
+        "rerank": _rerank_cfg(raw.get("rerank")),
+    }
+
+
+def _rerank_cfg(raw: Any) -> Optional[Dict[str, Any]]:
+    """true / {"top_n": 24, "model": "...", "blend": 0.5} -> config, or None when disabled."""
+    if raw is None or raw is False:
+        return None
+    if raw is True:
+        return {"top_n": RERANK_TOP_N, "model": RERANK_MODEL, "blend": RERANK_BLEND}
+    if not isinstance(raw, dict):
+        raise KBError("bad_request", "weights.rerank must be a boolean or an object")
+    top_n = int(_weight_value(raw.get("top_n"), float(RERANK_TOP_N), minimum=1.0))
+    model = str(raw.get("model") or RERANK_MODEL).strip() or RERANK_MODEL
+    blend = _weight_value(raw.get("blend"), RERANK_BLEND)
+    if blend > 1.0:
+        raise KBError("bad_request", "weights.rerank.blend must be between 0 and 1")
+    return {"top_n": top_n, "model": model, "blend": blend}
+
+
+def _recency_cfg(raw: Any) -> Optional[Dict[str, float]]:
+    """{"half_life_days": 30, "min": 0.5, "max": 1.0} -> parsed config (or None)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise KBError("bad_request", "weights.recency must be an object")
+    half_life = _weight_value(raw.get("half_life_days"), 30.0, minimum=0.001)
+    floor = _weight_value(raw.get("min"), 0.25)
+    ceiling = _weight_value(raw.get("max"), 1.0)
+    if floor > ceiling:
+        raise KBError("bad_request", "weights.recency.min must be <= max")
+    return {"half_life_days": half_life, "min": floor, "max": ceiling}
+
+
+def _recency_mult(mtime: Any, cfg: Optional[Dict[str, float]],
+                  now: Optional[float] = None) -> Tuple[float, Optional[float]]:
+    """Exponential decay by document age: 0.5 ** (age / half_life), clamped.
+
+    Returns (multiplier, age_days). Records without a usable mtime get (1.0, None).
+    """
+    if cfg is None:
+        return 1.0, None
+    try:
+        stamp = float(mtime)
+    except (TypeError, ValueError):
+        return 1.0, None
+    if stamp <= 0:
+        return 1.0, None
+    current = time.time() if now is None else now
+    age_days = max(0.0, (current - stamp) / 86400.0)
+    mult = 0.5 ** (age_days / max(cfg["half_life_days"], 0.001))
+    mult = min(cfg["max"], max(cfg["min"], mult))
+    return mult, round(age_days, 2)
+
+
+
+
+def _kb_root(params: Dict[str, Any]) -> str:
+    root = params.get("kb_root")
+    if not isinstance(root, str) or not root.strip():
+        raise KBError("bad_request", "params.kb_root must be a non-empty string")
+    path = os.path.abspath(os.path.expanduser(root.strip()))
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as exc:
+        raise KBError("kb_root_error", "cannot create kb_root: %s" % exc)
+    if not os.path.isdir(path):
+        raise KBError("kb_root_error", "kb_root is not a directory: %s" % path)
+    return path
+
+
+def _walk_files(root: str, recursive: bool) -> Iterable[str]:
+    """Yield supported files under *root* deterministically."""
+    if recursive:
+        visited = set()
+        for dirpath, dirnames, filenames in os.walk(root):
+            real_dir = os.path.realpath(dirpath)
+            if real_dir in visited:
+                dirnames[:] = []
+                continue
+            visited.add(real_dir)
+            dirnames[:] = sorted(
+                name for name in dirnames
+                if not name.startswith(".") and name not in _SKIP_DIRS
+            )
+            for name in sorted(filenames):
+                if _ext(name) in SUPPORTED_EXTS:
+                    yield os.path.join(dirpath, name)
+    else:
+        try:
+            entries = sorted(os.listdir(root))
+        except OSError:
+            return
+        for name in entries:
+            candidate = os.path.join(root, name)
+            if os.path.isfile(candidate) and _ext(candidate) in SUPPORTED_EXTS:
+                yield candidate
+
+
+def _wants_embeddings(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in ("false", "0", "no", "off", "never", "none")
+    return bool(value)
+
+
+# --------------------------------------------------------------------------
+# chunking
+# --------------------------------------------------------------------------
+def _line_numbers(text: str) -> List[int]:
+    return [index for index, char in enumerate(text) if char == "\n"]
+
+
+def _offset_line(newlines: Sequence[int], offset: int) -> int:
+    return bisect.bisect_left(newlines, offset)
+
+
+# Ordered by preference: paragraph breaks first, then sentence/clause ends,
+# then any whitespace, then a hard character cut.
+_BREAK_GROUPS: Tuple[Tuple[Tuple[str, ...], bool], ...] = (
+    (("\n\n",), False),
+    (("。", "！", "？", "；", "\n", ". ", "! ", "? ", "; "), True),
+    (("，", ", ", " ", "\t"), True),
+)
+
+
+def _choose_break(text: str, start: int, hard_end: int) -> int:
+    """Pick the nicest break point in the second half of [start, hard_end)."""
+    low = start + max(1, (hard_end - start) // 3)
+    for seps, cut_after in _BREAK_GROUPS:
+        best_index = -1
+        best_len = 0
+        for sep in seps:
+            index = text.rfind(sep, low, hard_end)
+            if index > best_index:
+                best_index = index
+                best_len = len(sep)
+        if best_index >= 0:
+            end = best_index + (best_len if cut_after else 0)
+            if end > start:
+                return min(end, hard_end)
+    return hard_end
+
+
+def split_offsets(text: str, max_chars: int = MAX_CHUNK_CHARS,
+                  overlap: int = CHUNK_OVERLAP) -> List[Tuple[int, int]]:
+    """Split ``text`` into overlapping ``(start, end)`` spans, each <= max_chars."""
+    total = len(text)
+    if total <= 0:
+        return []
+    if total <= max_chars:
+        return [(0, total)]
+    spans: List[Tuple[int, int]] = []
+    start = 0
+    while start < total:
+        hard_end = min(start + max_chars, total)
+        if hard_end >= total:
+            spans.append((start, total))
+            break
+        end = _choose_break(text, start, hard_end)
+        if end <= start:
+            end = hard_end
+        spans.append((start, end))
+        nxt = end - overlap
+        if nxt <= start:
+            nxt = end
+        start = nxt
+    return spans
+
+
+def _span_chunk(text: str, newlines: Sequence[int], base_line: int,
+                start: int, end: int) -> Optional[Tuple[str, int, int]]:
+    """Materialise a span as (text, start_line, end_line) with whitespace stripped."""
+    raw = text[start:end]
+    leading = len(raw) - len(raw.lstrip())
+    inner_start = start + leading
+    inner_end = start + len(raw.rstrip())
+    if inner_end <= inner_start:
+        return None
+    body = text[inner_start:inner_end]
+    if not body:
+        return None
+    start_line = base_line + _offset_line(newlines, inner_start)
+    end_line = base_line + _offset_line(newlines, inner_end - 1)
+    return body, start_line, end_line
+
+
+_ATX_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.*)$")
+_TRAILING_HASHES_RE = re.compile(r"[ \t]+#+[ \t]*$")
+
+
+def _parse_atx(line: str) -> Optional[Tuple[int, str]]:
+    match = _ATX_RE.match(line)
+    if not match:
+        return None
+    level = len(match.group(1))
+    body = _TRAILING_HASHES_RE.sub("", match.group(2)).strip()
+    if not body:
+        return None
+    return level, body
+
+
+def _new_section(heading: Optional[str], level: int, lineno: int) -> Dict[str, Any]:
+    return {"heading": heading, "level": level, "start": lineno, "lines": []}
+
+
+def _markdown_sections(text: str) -> List[Dict[str, Any]]:
+    """Split Markdown into sections at ATX headings (fenced code respected)."""
+    lines = text.split("\n")
+    sections: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+    fence: Optional[str] = None
+
+    for lineno, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if fence is not None:
+            if stripped.startswith(fence):
+                fence = None
+            if current is None:
+                current = _new_section(None, 0, lineno)
+            current["lines"].append((lineno, line))
+            continue
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            fence = "```" if stripped.startswith("```") else "~~~"
+            if current is None:
+                current = _new_section(None, 0, lineno)
+            current["lines"].append((lineno, line))
+            continue
+        atx = _parse_atx(line)
+        if atx is not None:
+            if current is not None:
+                sections.append(current)
+            level, body = atx
+            current = _new_section("#" * level + " " + body, level, lineno)
+            current["lines"].append((lineno, line))
+        else:
+            if current is None:
+                current = _new_section(None, 0, lineno)
+            current["lines"].append((lineno, line))
+
+    if current is not None:
+        sections.append(current)
+    return sections
+
+
+def _heading_text(heading: Optional[str]) -> str:
+    if not heading:
+        return ""
+    return heading.lstrip("#").strip()
+
+
+def chunk_markdown(text: str,
+                   fallback_title: Optional[str] = None,
+                   max_chars: int = MAX_CHUNK_CHARS,
+                   overlap: int = CHUNK_OVERLAP) -> Tuple[str, List[Dict[str, Any]]]:
+    """Chunk Markdown by ATX heading, splitting oversized sections."""
+    sections = _markdown_sections(text or "")
+    title = None
+    for section in sections:
+        if section["heading"] and section["level"] == 1:
+            title = _heading_text(section["heading"])
+            break
+    if not title:
+        for section in sections:
+            if section["heading"]:
+                title = _heading_text(section["heading"])
+                break
+    if not title:
+        title = fallback_title or "Untitled"
+
+    chunks: List[Dict[str, Any]] = []
+    for section in sections:
+        body = "\n".join(line for _, line in section["lines"])
+        if not body.strip():
+            continue
+        heading = section["heading"] or title
+        newlines = _line_numbers(body)
+        for start, end in split_offsets(body, max_chars, overlap):
+            piece = _span_chunk(body, newlines, section["start"], start, end)
+            if piece is None:
+                continue
+            piece_text, start_line, end_line = piece
+            chunks.append({
+                "heading": heading,
+                "start_line": start_line,
+                "end_line": end_line,
+                "page": None,
+                "text": piece_text,
+            })
+    return title, chunks
+
+
+def chunk_text_plain(text: str,
+                     fallback_title: Optional[str] = None,
+                     max_chars: int = MAX_CHUNK_CHARS,
+                     overlap: int = CHUNK_OVERLAP) -> Tuple[str, List[Dict[str, Any]]]:
+    """Chunk plain text: paragraphs merged greedily up to max_chars, with overlap."""
+    body = text or ""
+    title = None
+    for line in body.split("\n"):
+        if line.strip():
+            title = line.strip()[:120]
+            break
+    if not title:
+        title = fallback_title or "Untitled"
+
+    chunks: List[Dict[str, Any]] = []
+    if body.strip():
+        newlines = _line_numbers(body)
+        for start, end in split_offsets(body, max_chars, overlap):
+            piece = _span_chunk(body, newlines, 1, start, end)
+            if piece is None:
+                continue
+            piece_text, start_line, end_line = piece
+            chunks.append({
+                "heading": title,
+                "start_line": start_line,
+                "end_line": end_line,
+                "page": None,
+                "text": piece_text,
+            })
+    return title, chunks
+
+
+def _chunk_extracted(title: Optional[str], text: str,
+                     max_chars: int = MAX_CHUNK_CHARS,
+                     overlap: int = CHUNK_OVERLAP) -> Tuple[str, List[Dict[str, Any]]]:
+    """Chunk text extracted from docx/html/json, forcing the document title."""
+    fallback, chunks = chunk_text_plain(text, title, max_chars, overlap)
+    final = (title or fallback or "Untitled").strip()[:120]
+    for chunk in chunks:
+        chunk["heading"] = final
+    return final, chunks
+
+
+def _xml_unescape(value: str) -> str:
+    import html as _html
+    return _html.unescape(value)
+
+
+def extract_docx(path: str) -> Tuple[str, str]:
+    """Extract paragraph text from a .docx (zip + word/document.xml), stdlib only."""
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = set(archive.namelist())
+            if "word/document.xml" not in names:
+                raise KBError("docx_invalid",
+                              "missing word/document.xml (not a .docx file?)")
+            xml = archive.read("word/document.xml").decode("utf-8", "replace")
+            title = ""
+            if "docProps/core.xml" in names:
+                core = archive.read("docProps/core.xml").decode("utf-8", "replace")
+                match = re.search(r"<dc:title[^>]*>(.*?)</dc:title>", core, re.S)
+                if match:
+                    title = _xml_unescape(re.sub(r"<[^>]+>", "", match.group(1))).strip()
+    except KBError:
+        raise
+    except zipfile.BadZipFile:
+        raise KBError("docx_invalid", "not a valid .docx (zip) file")
+    except OSError as exc:
+        raise KBError("docx_invalid", "cannot read docx: %s" % exc)
+
+    paragraphs: List[str] = []
+    for block in re.findall(r"<w:p[ >].*?</w:p>", xml, re.S):
+        runs = re.findall(r"<w:t[^>]*>(.*?)</w:t>", block, re.S)
+        line = "".join(_xml_unescape(re.sub(r"<[^>]+>", "", run)) for run in runs)
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        if line:
+            paragraphs.append(line)
+    title = title or (paragraphs[0] if paragraphs else _stem(path))
+    return (title[:120], "\n\n".join(paragraphs))
+
+
+class _HTMLTextParser:
+    """Minimal HTML -> text: drops script/style/noscript, blocks become newlines."""
+
+    SKIP_TAGS = {"script", "style", "noscript", "template", "svg", "canvas"}
+    BLOCK_TAGS = {
+        "p", "div", "br", "li", "ul", "ol", "tr", "td", "th", "table", "thead",
+        "tbody", "section", "article", "header", "footer", "nav", "aside",
+        "main", "blockquote", "pre", "h1", "h2", "h3", "h4", "h5", "h6",
+        "dt", "dd", "dl", "figure", "figcaption", "form", "hr",
+    }
+
+
+def extract_html(path: str) -> Tuple[str, str]:
+    """Extract visible text from .html/.htm, stdlib HTMLParser only."""
+    from html.parser import HTMLParser
+
+    class Parser(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.parts: List[str] = []
+            self.title_parts: List[str] = []
+            self.skip_depth = 0
+            self.in_title = False
+
+        def handle_starttag(self, tag: str, attrs: Any) -> None:
+            name = tag.lower()
+            if name in _HTMLTextParser.SKIP_TAGS:
+                self.skip_depth += 1
+            elif name == "title":
+                self.in_title = True
+            elif name in _HTMLTextParser.BLOCK_TAGS and not self.skip_depth:
+                self.parts.append("\n")
+
+        def handle_endtag(self, tag: str) -> None:
+            name = tag.lower()
+            if name in _HTMLTextParser.SKIP_TAGS and self.skip_depth:
+                self.skip_depth -= 1
+            elif name == "title":
+                self.in_title = False
+            elif name in _HTMLTextParser.BLOCK_TAGS and not self.skip_depth:
+                self.parts.append("\n")
+
+        def handle_data(self, data: str) -> None:
+            if self.in_title:
+                self.title_parts.append(data)
+                return
+            if self.skip_depth:
+                return
+            self.parts.append(data)
+
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        raise KBError("html_parse_failed", "cannot read html: %s" % exc)
+    text = None
+    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
+        try:
+            text = raw.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        text = raw.decode("utf-8", "replace")
+
+    parser = Parser()
+    try:
+        parser.feed(text)
+        parser.close()
+    except Exception as exc:
+        raise KBError("html_parse_failed", "cannot parse html: %s" % exc)
+
+    lines = []
+    for line in "".join(parser.parts).split("\n"):
+        cleaned = re.sub(r"[ \t\r\f\v]+", " ", line).strip()
+        if cleaned:
+            lines.append(cleaned)
+    title = re.sub(r"\s+", " ", "".join(parser.title_parts)).strip()
+    return (title or _stem(path), "\n\n".join(lines))
+
+
+def _flatten_json(value: Any, path: str, depth: int, out: List[str]) -> None:
+    if len("\n".join(out)) > JSON_MAX_TEXT_CHARS:
+        return
+    if depth > JSON_MAX_DEPTH:
+        out.append("%s = ..." % (path or "$"))
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            label = re.sub(r"\s+", " ", str(key)).strip()[:120] or "(empty)"
+            child = "%s.%s" % (path, label) if path else label
+            _flatten_json(item, child, depth + 1, out)
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _flatten_json(item, "%s[%d]" % (path, index), depth + 1, out)
+    else:
+        if value is None:
+            rendered = "null"
+        elif isinstance(value, bool):
+            rendered = "true" if value else "false"
+        else:
+            rendered = str(value).replace("\r\n", "\n").replace("\n", " ")
+        if len(rendered) > JSON_MAX_VALUE_CHARS:
+            rendered = rendered[:JSON_MAX_VALUE_CHARS] + "…"
+        out.append("%s = %s" % (path or "$", rendered))
+
+
+def extract_json(path: str) -> Tuple[str, str]:
+    """Flatten a .json document into ``a.b[0] = value`` lines for retrieval."""
+    import json as _json
+    try:
+        with open(path, "rb") as handle:
+            payload = _json.loads(handle.read().decode("utf-8-sig"))
+    except UnicodeDecodeError:
+        raise KBError("json_invalid", "json file is not valid UTF-8")
+    except _json.JSONDecodeError as exc:
+        raise KBError("json_invalid",
+                      "invalid JSON at line %d column %d: %s"
+                      % (exc.lineno, exc.colno, exc.msg))
+    except OSError as exc:
+        raise KBError("json_invalid", "cannot read json: %s" % exc)
+    lines: List[str] = []
+    _flatten_json(payload, "", 0, lines)
+    title = _stem(path)
+    if isinstance(payload, dict):
+        for candidate in ("title", "name", "id"):
+            value = payload.get(candidate)
+            if isinstance(value, str) and value.strip():
+                title = value.strip()[:120]
+                break
+    return (title, "\n".join(lines))
+
+
+def chunk_pdf(path: str,
+              max_chars: int = MAX_CHUNK_CHARS,
+              overlap: int = CHUNK_OVERLAP) -> Tuple[str, Optional[int], List[Dict[str, Any]]]:
+    """Chunk a PDF page by page; 1-based ``page`` numbers."""
+    try:
+        import fitz  # type: ignore  # PyMuPDF
+    except Exception:
+        raise KBError("pdf_unavailable",
+                      "pymupdf is not installed; PDF ingestion is unavailable")
+    try:
+        document = fitz.open(path)
+    except Exception as exc:
+        raise KBError("pdf_open_failed", "cannot open PDF: %s" % exc)
+
+    title = _stem(path)
+    try:
+        try:
+            metadata = document.metadata or {}
+        except Exception:
+            metadata = {}
+        if isinstance(metadata, dict):
+            candidate = metadata.get("title")
+            if candidate and str(candidate).strip():
+                title = str(candidate).strip()
+        pages = int(getattr(document, "page_count", 0) or 0)
+        chunks: List[Dict[str, Any]] = []
+        for index in range(pages):
+            try:
+                page = document.load_page(index)
+                page_text = page.get_text("text") or ""
+            except Exception as exc:
+                log_event(None, "warn", "pdf page %d unreadable: %s" % (index + 1, exc))
+                continue
+            if not page_text.strip():
+                continue
+            newlines = _line_numbers(page_text)
+            for start, end in split_offsets(page_text, max_chars, overlap):
+                piece = _span_chunk(page_text, newlines, 1, start, end)
+                if piece is None:
+                    continue
+                piece_text, start_line, end_line = piece
+                chunks.append({
+                    "heading": title,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "page": index + 1,
+                    "text": piece_text,
+                })
+        return title, pages, chunks
+    finally:
+        try:
+            document.close()
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------
+# tokenisation + BM25 (pure standard library)
+# --------------------------------------------------------------------------
+_LATIN_RE = re.compile(r"[a-z0-9_]+")
+_HAN_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+                         r"\U00020000-\U0002ebef]+")
+
+
+def tokenize(text: str) -> List[str]:
+    """Lowercase latin words + CJK bigrams + single han characters as fallback."""
+    if not text:
+        return []
+    lowered = text.lower()
+    tokens = _LATIN_RE.findall(lowered)
+    for run in _HAN_RUN_RE.findall(lowered):
+        if len(run) == 1:
+            tokens.append(run)
+            continue
+        tokens.extend(run[index:index + 2] for index in range(len(run) - 1))
+        tokens.extend(run)  # single-character fallback
+    return tokens
+
+
+class BM25Index:
+    """Okapi BM25 (k1=1.2, b=0.75) over pre-tokenised documents."""
+
+    def __init__(self, documents: Sequence[Sequence[str]]) -> None:
+        self.k1 = BM25_K1
+        self.b = BM25_B
+        self.n = len(documents)
+        self.doc_tf = [Counter(document) for document in documents]
+        self.doc_len = [sum(counts.values()) for counts in self.doc_tf]
+        self.avgdl = (sum(self.doc_len) / float(self.n)) if self.n else 0.0
+        # Postings carry their term frequency, so scoring never has to look the
+        # term up again in the per-document counter (that lookup dominated large
+        # indexes: 10k chunks spent ~70 ms per query in Counter.get).
+        self.postings: Dict[str, List[Tuple[int, int]]] = {}
+        for index, counts in enumerate(self.doc_tf):
+            for term, tf in counts.items():
+                self.postings.setdefault(term, []).append((index, tf))
+        self._idf: Dict[str, float] = {}
+
+    def idf(self, term: str) -> float:
+        cached = self._idf.get(term)
+        if cached is not None:
+            return cached
+        df = len(self.postings.get(term, ()))
+        if not self.n:
+            value = 0.0
+        else:
+            value = math.log(1.0 + (self.n - df + 0.5) / (df + 0.5))
+        self._idf[term] = value
+        return value
+
+    def scores(self, query_tokens: Sequence[str]) -> List[float]:
+        scores = [0.0] * self.n
+        if not self.n or not query_tokens:
+            return scores
+        query_tf = Counter(query_tokens)
+        for term, query_count in query_tf.items():
+            docs = self.postings.get(term)
+            if not docs:
+                continue
+            idf = self.idf(term)
+            if idf <= 0.0:
+                continue
+            for index, tf in docs:
+                doc_len = self.doc_len[index] or 1
+                denominator = tf + self.k1 * (
+                    1.0 - self.b + self.b * doc_len / (self.avgdl or 1.0)
+                )
+                if denominator <= 0.0:
+                    continue
+                scores[index] += idf * (tf * (self.k1 + 1.0) / denominator) * query_count
+        return scores
+
+
+def _snippet(text: str, limit: int = SNIPPET_CHARS) -> str:
+    collapsed = re.sub(r"\s+", " ", text or "").strip()
+    if len(collapsed) <= limit:
+        return collapsed
+    if limit <= 1:
+        return collapsed[:limit]
+    return collapsed[:limit - 1] + "\u2026"
+
+
+# --------------------------------------------------------------------------
+# optional dense backend
+# --------------------------------------------------------------------------
+class DenseBackend:
+    """Lazy sentence-transformers backend; ``capable`` is an import probe only.
+
+    Loading the model costs ~14 s on CPU, so ``start_warmup`` can load it in a
+    daemon thread while BM25 keeps serving.  ``ensure_loaded`` stays blocking
+    and joins an in-flight warm-up; ``is_loaded`` / ``loading`` are cheap probes
+    used by the lazy ``auto`` mode.
+    """
+
+    backend_kind = "sentence-transformers"
+    lazy = (os.environ.get("KB_LITE_LAZY_DENSE") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+    def __init__(self, model_name: Optional[str] = None) -> None:
+        self.model_name = model_name or os.environ.get("KB_LITE_MODEL") or DENSE_MODEL
+        self._model = None
+        self._numpy = None
+        self._load_attempted = False
+        self._load_error: Optional[str] = None
+        self._load_lock = threading.Lock()
+        self._warmup_thread: Optional[Any] = None
+
+    @property
+    def capable(self) -> bool:
+        return _module_present("numpy") and _module_present("sentence_transformers")
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._model is not None
+
+    @property
+    def loading(self) -> bool:
+        thread = self._warmup_thread
+        return bool(thread is not None and thread.is_alive())
+
+    def start_warmup(self) -> bool:
+        """Start a background model load; True when this call started one."""
+        if self._model is not None or self._load_attempted:
+            return False
+        with self._load_lock:
+            if self._model is not None or self._load_attempted:
+                return False
+            self._load_attempted = True
+            thread = threading.Thread(
+                target=self._load_model, name="kb-dense-warmup", daemon=True)
+            self._warmup_thread = thread
+            try:
+                thread.start()
+            except Exception as exc:
+                self._warmup_thread = None
+                self._load_attempted = False
+                self._load_error = "%s: %s" % (type(exc).__name__, exc)
+                _stderr("warn", "cannot start dense warmup: %s" % self._load_error)
+                return False
+        return True
+
+    def ensure_loaded(self) -> bool:
+        if self._model is not None:
+            return True
+        thread = self._warmup_thread
+        if thread is not None:
+            thread.join()
+            return self._model is not None
+        with self._load_lock:
+            if self._model is not None:
+                return True
+            if self._load_attempted:
+                return False
+            self._load_attempted = True
+        self._load_model()
+        return self._model is not None
+
+    def _load_model(self) -> None:
+        if not self.capable:
+            self._load_error = "numpy and sentence-transformers are required"
+            return
+        try:
+            import numpy as np  # noqa: F401  (imported for its side effect)
+            from sentence_transformers import SentenceTransformer  # type: ignore
+        except Exception as exc:
+            self._load_error = "%s: %s" % (type(exc).__name__, exc)
+            _stderr("warn", "dense backend unavailable: %s" % self._load_error)
+            return
+        try:
+            self._model = SentenceTransformer(self.model_name)
+            self._numpy = np
+        except Exception as exc:
+            self._load_error = "%s: %s" % (type(exc).__name__, exc)
+            _stderr("warn", "cannot load embedding model %r: %s"
+                    % (self.model_name, self._load_error))
+
+    def encode(self, texts: Sequence[str], is_query: bool = False) -> List[List[float]]:
+        del is_query  # the caller applies the bge query prefix
+        if not self.ensure_loaded() or self._model is None:
+            raise KBError("dense_unavailable",
+                          "dense backend unavailable: %s"
+                          % (self._load_error or "unknown error"))
+        payload = list(texts)
+        if not payload:
+            return []
+        try:
+            vectors = self._model.encode(
+                payload, normalize_embeddings=True, convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+        except TypeError:
+            vectors = self._model.encode(
+                payload, convert_to_numpy=True, show_progress_bar=False,
+            )
+            vectors = self._normalise(vectors)
+        return [[float(value) for value in row] for row in vectors]
+
+    def _normalise(self, vectors: Any) -> Any:
+        try:
+            import numpy as np
+            array = np.asarray(vectors, dtype="float32")
+            if array.ndim == 1:
+                array = array.reshape(1, -1)
+            norms = np.linalg.norm(array, axis=1, keepdims=True)
+            norms[norms == 0.0] = 1.0
+            return array / norms
+        except Exception:
+            return vectors
+
+
+class FakeHashBackend:
+    """Deterministic hashed bag-of-words embedder, enabled with KB_LITE_EMBED=fake.
+
+    It exists so the dense/hybrid pipeline and vector persistence can be
+    tested end to end without numpy, network access or a real model.  Tokens
+    come from the same tokenizer BM25 uses, each token is hashed into
+    ``[0, dim)`` and the resulting vector is L2-normalised.
+    """
+
+    backend_kind = "fake"
+
+    def __init__(self, dim: int = 64) -> None:
+        try:
+            dim = int(dim)
+        except (TypeError, ValueError):
+            dim = 64
+        self.dim = max(1, min(4096, dim))
+        self.model_name = "fake-hash-%d" % self.dim
+
+    @property
+    def capable(self) -> bool:
+        return True
+
+    def ensure_loaded(self) -> bool:
+        return True
+
+    def encode(self, texts: Sequence[str], is_query: bool = False) -> List[List[float]]:
+        vectors: List[List[float]] = []
+        for raw in texts:
+            text = raw or ""
+            if is_query and text.startswith(BGE_QUERY_PREFIX):
+                text = text[len(BGE_QUERY_PREFIX):]
+            vector = [0.0] * self.dim
+            for token in tokenize(text):
+                digest = hashlib.sha1(token.encode("utf-8")).digest()
+                vector[int.from_bytes(digest[:8], "big") % self.dim] += 1.0
+            norm = math.sqrt(sum(value * value for value in vector))
+            if norm > 0.0:
+                vector = [value / norm for value in vector]
+            vectors.append(vector)
+        return vectors
+
+
+def _dense_disabled() -> bool:
+    value = (os.environ.get("KB_LITE_DENSE") or "").strip().lower()
+    return value in ("0", "false", "no", "off", "none", "disabled")
+
+
+def _fake_dim() -> int:
+    raw = os.environ.get("KB_LITE_EMBED_DIM")
+    if raw:
+        try:
+            return max(1, min(4096, int(str(raw).strip())))
+        except (TypeError, ValueError):
+            pass
+    return 64
+
+
+def make_dense_backend() -> Optional[Any]:
+    """Pick the embedding backend from the environment.
+
+    ``KB_LITE_DENSE=0`` disables dense retrieval entirely.  ``KB_LITE_EMBED``
+    may be ``fake`` (deterministic test embedder), ``none``, or left at its
+    default / ``auto`` / ``sentence-transformers`` for the real backend.
+    """
+    if _dense_disabled():
+        return None
+    choice = (os.environ.get("KB_LITE_EMBED") or "").strip().lower()
+    if choice in ("fake", "hash", "hashed", "stub"):
+        return FakeHashBackend(_fake_dim())
+    if choice in ("none", "off", "disabled"):
+        return None
+    backend = DenseBackend()
+    return backend if backend.capable else None
+
+
+def _dense_dot(matrix: Any, query_vector: Sequence[float]) -> Optional[List[float]]:
+    """Cosine scores (vectors are normalised) or None when dimensions mismatch."""
+    if matrix is None or query_vector is None:
+        return None
+    if len(matrix) != 0:
+        try:
+            first = matrix[0]
+            if len(first) != len(query_vector):
+                return None
+        except Exception:
+            return None
+    try:
+        import numpy as np
+        array = np.asarray(matrix, dtype="float32")
+        query = np.asarray(list(query_vector), dtype="float32")
+        if array.ndim != 2 or array.shape[1] != query.shape[0]:
+            return None
+        return [float(value) for value in array.dot(query)]
+    except Exception:
+        pass
+    scores: List[float] = []
+    for row in matrix:
+        try:
+            if len(row) != len(query_vector):
+                return None
+            scores.append(float(sum(float(a) * float(b)
+                                    for a, b in zip(row, query_vector))))
+        except Exception:
+            return None
+    return scores
+
+
+# --------------------------------------------------------------------------
+# engine
+# --------------------------------------------------------------------------
+class KBEngine:
+    """Stateless-with-respect-to-roots request handler.
+
+    Manifest/chunk reads and the BM25 index are cached per root, keyed by
+    ``(mtime_ns, size)`` of ``chunks.jsonl`` and invalidated on save/clear.
+    One process can still serve several ``kb_root`` values safely: any write
+    path drops the cached entry for that root, and external edits are detected
+    by the stat key.
+    """
+
+    def __init__(self, dense_backend: Optional[Any] = None) -> None:
+        if dense_backend is None:
+            dense_backend = make_dense_backend()
+        self.dense = dense_backend
+        self._chunk_cache: Dict[str, Tuple[Tuple[int, int],
+                                           List[Dict[str, Any]]]] = {}
+        self._index_cache: Dict[str, Tuple[Any, "BM25Index"]] = {}
+
+    # -- backend reporting -------------------------------------------------
+    def _backend_report(self) -> Tuple[str, Optional[str], bool]:
+        """Return (backend_name, dense_model, dense_available)."""
+        backend = self.dense
+        if backend is None:
+            return "none", None, False
+        capable = bool(getattr(backend, "capable", False))
+        if not capable:
+            return "none", None, False
+        kind = getattr(backend, "backend_kind", None)
+        if not kind:
+            kind = "sentence-transformers" if isinstance(backend, DenseBackend) else "fake"
+        return kind, getattr(backend, "model_name", None), True
+
+    # -- protocol plumbing -------------------------------------------------
+    def ready_event(self) -> Dict[str, Any]:
+        backend, _model, dense = self._backend_report()
+        return {
+            "event": "ready",
+            "version": ENGINE_VERSION,
+            "dense": dense,
+            "numpy": _module_present("numpy"),
+            "backend": backend,
+        }
+
+    def handle_request(self, request: Any) -> Dict[str, Any]:
+        request_id = request.get("id") if isinstance(request, dict) else None
+        try:
+            if not isinstance(request, dict):
+                raise KBError("bad_request", "request must be a JSON object")
+            op = request.get("op")
+            if not isinstance(op, str) or not op:
+                raise KBError("bad_request", "request.op must be a non-empty string")
+            params = request.get("params")
+            if params is None:
+                params = {}
+            if not isinstance(params, dict):
+                raise KBError("bad_request", "request.params must be an object")
+            handler = {
+                "ping": self.op_ping,
+                "warmup": self.op_warmup,
+                "stats": self.op_stats,
+                "ingest": self.op_ingest,
+                "search": self.op_search,
+                "ask": self.op_ask,
+                "outline": self.op_outline,
+                "get": self.op_get,
+                "watch": self.op_watch,
+                "clear": self.op_clear,
+            }.get(op)
+            if handler is None:
+                raise KBError("unknown_op", "unknown op: %s" % op)
+            result = handler(params)
+            return {"id": request_id, "ok": True, "result": result}
+        except KBError as exc:
+            return {"id": request_id, "ok": False,
+                    "error": {"code": exc.code, "message": exc.message}}
+        except Exception as exc:
+            _stderr("error", "internal_error: %s\n%s"
+                    % (exc, traceback.format_exc()))
+            return {"id": request_id, "ok": False,
+                    "error": {"code": "internal_error",
+                              "message": "%s: %s" % (type(exc).__name__, exc)}}
+
+    # -- storage -----------------------------------------------------------
+    def _load_manifest(self, root: str) -> Dict[str, Any]:
+        path = _child(root, MANIFEST_NAME)
+        empty = {"version": MANIFEST_VERSION, "docs": {}, "updated_at": None}
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except FileNotFoundError:
+            return empty
+        except (OSError, ValueError) as exc:
+            log_event(root, "warn", "manifest unreadable, starting empty: %s" % exc)
+            return empty
+        if not isinstance(data, dict):
+            log_event(root, "warn", "manifest is not an object, starting empty")
+            return empty
+        docs = data.get("docs")
+        if not isinstance(docs, dict):
+            docs = {}
+        clean: Dict[str, Any] = {}
+        for doc_id, entry in docs.items():
+            if isinstance(doc_id, str) and isinstance(entry, dict):
+                clean[doc_id] = entry
+        chunk_cfg = data.get("chunk")
+        return {
+            "version": MANIFEST_VERSION,
+            "docs": clean,
+            "chunk": chunk_cfg if isinstance(chunk_cfg, dict) else {},
+            "updated_at": data.get("updated_at"),
+        }
+
+    def _save_manifest(self, root: str, manifest: Dict[str, Any]) -> None:
+        path = _child(root, MANIFEST_NAME)
+        payload = json.dumps(manifest, ensure_ascii=False, indent=2)
+        _atomic_write(path, (payload + "\n").encode("utf-8"))
+
+    def _load_chunks(self, root: str) -> List[Dict[str, Any]]:
+        path = _child(root, CHUNKS_NAME)
+        try:
+            stat = os.stat(path)
+        except FileNotFoundError:
+            self._chunk_cache.pop(root, None)
+            return []
+        except OSError as exc:
+            log_event(root, "warn", "chunks.jsonl unreadable: %s" % exc)
+            return []
+        key = (stat.st_mtime_ns, stat.st_size)
+        cached = self._chunk_cache.get(root)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        chunks: List[Dict[str, Any]] = []
+        try:
+            handle = open(path, "r", encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            return chunks
+        except OSError as exc:
+            log_event(root, "warn", "chunks.jsonl unreadable: %s" % exc)
+            return chunks
+        with handle:
+            for lineno, line in enumerate(handle, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    log_event(root, "warn", "chunks.jsonl line %d is not JSON" % lineno)
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                chunk_id = record.get("chunk_id")
+                doc_id = record.get("doc_id")
+                text = record.get("text")
+                if not isinstance(chunk_id, str) or not isinstance(doc_id, str) \
+                        or not isinstance(text, str):
+                    continue
+                try:
+                    ordinal = int(record.get("ordinal") or 0)
+                except (TypeError, ValueError):
+                    ordinal = 0
+                chunks.append({
+                    "chunk_id": chunk_id,
+                    "doc_id": doc_id,
+                    "ordinal": ordinal,
+                    "heading": record.get("heading"),
+                    "start_line": record.get("start_line"),
+                    "end_line": record.get("end_line"),
+                    "page": record.get("page"),
+                    "text": text,
+                    # Case-folded copy: phrase boost scans every chunk on every
+                    # query, and folding 10k chunks per query dominated search.
+                    "text_l": text.casefold(),
+                })
+        self._chunk_cache[root] = (key, chunks)
+        return chunks
+
+    def _save_chunks(self, root: str, chunks: Sequence[Dict[str, Any]]) -> None:
+        path = _child(root, CHUNKS_NAME)
+        lines = []
+        for chunk in chunks:
+            lines.append(json.dumps({
+                "chunk_id": chunk.get("chunk_id"),
+                "doc_id": chunk.get("doc_id"),
+                "ordinal": chunk.get("ordinal"),
+                "heading": chunk.get("heading"),
+                "start_line": chunk.get("start_line"),
+                "end_line": chunk.get("end_line"),
+                "page": chunk.get("page"),
+                "text": chunk.get("text", ""),
+            }, ensure_ascii=False))
+        payload = "\n".join(lines)
+        if payload:
+            payload += "\n"
+        _atomic_write(path, payload.encode("utf-8"))
+        self._chunk_cache.pop(root, None)
+        self._index_cache.pop(root, None)
+
+    def _vector_meta(self, root: str) -> Dict[str, Any]:
+        path = _child(root, VECTORS_META)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _vector_dim(vectors: Any) -> int:
+        try:
+            return len(vectors[0]) if len(vectors) else 0
+        except Exception:
+            return 0
+
+    def _valid_vectors(self, root: str, vectors: Any) -> Optional[Any]:
+        """Reject vectors built by another model or with a different width."""
+        if vectors is None:
+            return None
+        meta = self._vector_meta(root)
+        expected = getattr(self.dense, "model_name", None) if self.dense is not None else None
+        meta_model = meta.get("model")
+        if meta_model and expected and str(meta_model) != str(expected):
+            log_event(root, "warn",
+                      "vector model mismatch (index=%r current=%r); ignoring vectors"
+                      % (meta_model, expected))
+            return None
+        dim = self._vector_dim(vectors)
+        meta_dim = meta.get("dim")
+        if meta_dim is not None:
+            try:
+                if int(meta_dim) != dim:
+                    log_event(root, "warn",
+                              "vector dim mismatch (index=%r actual=%r); ignoring vectors"
+                              % (meta_dim, dim))
+                    return None
+            except (TypeError, ValueError):
+                pass
+        return vectors
+
+    def _load_vectors(self, root: str) -> Optional[Any]:
+        npy_path = _child(root, VECTORS_NPY)
+        json_path = _child(root, VECTORS_JSON)
+        if os.path.isfile(npy_path):
+            try:
+                import numpy as np
+                array = np.load(npy_path, allow_pickle=False)
+                if getattr(array, "ndim", 0) == 2:
+                    return self._valid_vectors(root, array.astype("float32"))
+                log_event(root, "warn", "vectors.npy has an unexpected shape")
+                return None
+            except Exception as exc:
+                log_event(root, "warn", "cannot load vectors.npy: %s" % exc)
+                return None
+        if os.path.isfile(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except (OSError, ValueError) as exc:
+                log_event(root, "warn", "cannot load vectors.json: %s" % exc)
+                return None
+            if isinstance(data, list) and (not data or isinstance(data[0], list)):
+                return self._valid_vectors(root, data)
+            log_event(root, "warn", "vectors.json has an unexpected shape")
+        return None
+
+    def _write_vector_meta(self, root: str, vectors: Sequence[Sequence[float]]) -> None:
+        model = getattr(self.dense, "model_name", None) if self.dense is not None else None
+        payload = {
+            "model": model,
+            "dim": self._vector_dim(vectors),
+            "count": len(vectors),
+            "built_at": _now_iso(),
+        }
+        try:
+            _atomic_write(_child(root, VECTORS_META),
+                          (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+        except Exception as exc:
+            log_event(root, "warn", "cannot write vector metadata: %s" % exc)
+
+    def _write_vectors(self, root: str, vectors: Sequence[Sequence[float]]) -> None:
+        npy_path = _child(root, VECTORS_NPY)
+        json_path = _child(root, VECTORS_JSON)
+        try:
+            import numpy as np
+        except Exception:
+            np = None  # type: ignore[assignment]
+        if np is not None:
+            array = np.asarray(vectors, dtype="float32")
+            tmp = "%s.tmp.%d" % (npy_path, os.getpid())
+            try:
+                with open(tmp, "wb") as handle:
+                    np.save(handle, array, allow_pickle=False)
+                os.replace(tmp, npy_path)
+            finally:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
+            try:
+                if os.path.isfile(json_path):
+                    os.remove(json_path)
+            except OSError:
+                pass
+            self._write_vector_meta(root, vectors)
+            return
+        tmp = "%s.tmp.%d" % (json_path, os.getpid())
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump([[float(value) for value in row] for row in vectors], handle)
+            os.replace(tmp, json_path)
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+        try:
+            if os.path.isfile(npy_path):
+                os.remove(npy_path)
+        except OSError:
+            pass
+        self._write_vector_meta(root, vectors)
+
+    @staticmethod
+    def _vector_key(chunk: Dict[str, Any]) -> str:
+        text = chunk.get("text") or ""
+        digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+        return "%s:%s:%s" % (chunk.get("doc_id"), chunk.get("ordinal"), digest)
+
+    def _sync_vectors(self, root: str, old_chunks: Sequence[Dict[str, Any]],
+                      new_chunks: Sequence[Dict[str, Any]],
+                      with_embeddings: Any) -> None:
+        """Keep vectors.npy / vectors.json row-aligned with chunks.jsonl."""
+        npy_path = _child(root, VECTORS_NPY)
+        json_path = _child(root, VECTORS_JSON)
+
+        def drop_vectors() -> None:
+            for path in (npy_path, json_path, _child(root, VECTORS_META)):
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except OSError:
+                    pass
+
+        cache: Dict[str, List[float]] = {}
+        if old_chunks and new_chunks:
+            old_vectors = self._load_vectors(root)
+            if old_vectors is not None and len(old_vectors) == len(old_chunks):
+                for chunk, vector in zip(old_chunks, old_vectors):
+                    try:
+                        cache[self._vector_key(chunk)] = [float(value) for value in vector]
+                    except (TypeError, ValueError):
+                        continue
+
+        prepared: List[Optional[List[float]]] = []
+        missing: List[int] = []
+        for index, chunk in enumerate(new_chunks):
+            vector = cache.get(self._vector_key(chunk))
+            prepared.append(vector)
+            if vector is None:
+                missing.append(index)
+
+        want = _wants_embeddings(with_embeddings)
+        capable = bool(self.dense is not None and getattr(self.dense, "capable", False))
+        if missing and want and capable:
+            try:
+                texts = [new_chunks[index]["text"] for index in missing]
+                produced = self.dense.encode(texts, is_query=False)
+                if len(produced) != len(texts):
+                    raise KBError("dense_error", "embedding count mismatch")
+                for index, vector in zip(missing, produced):
+                    row = [float(value) for value in vector]
+                    if not row:
+                        raise KBError("dense_error", "empty embedding returned")
+                    prepared[index] = row
+                missing = []
+            except Exception as exc:
+                log_event(root, "warn", "embedding failed, dropping vectors: %s" % exc)
+                missing = [index for index, vector in enumerate(prepared)
+                           if vector is None]
+
+        if not new_chunks:
+            drop_vectors()
+            return
+        if missing or any(vector is None for vector in prepared):
+            drop_vectors()
+            return
+        widths = {len(vector) for vector in prepared if vector is not None}
+        if len(widths) > 1:
+            log_event(root, "warn",
+                      "mixed vector dimensions %r; dropping vectors" % sorted(widths))
+            drop_vectors()
+            return
+        try:
+            self._write_vectors(root, [vector for vector in prepared if vector is not None])
+        except Exception as exc:
+            log_event(root, "warn", "cannot write vectors: %s" % exc)
+            drop_vectors()
+
+    # -- ops ---------------------------------------------------------------
+    def op_ping(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        del params
+        _backend, _model, dense = self._backend_report()
+        return {
+            "pong": True,
+            "version": ENGINE_VERSION,
+            "dense": dense,
+            "dense_loaded": bool(getattr(self.dense, "is_loaded", False)),
+            "numpy": _module_present("numpy"),
+        }
+
+    def op_warmup(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Load the embedding model, optionally in the background."""
+        started = time.time()
+        backend = self.dense
+        capable = bool(backend is not None and getattr(backend, "capable", False))
+        if not capable:
+            return {
+                "ok": False,
+                "dense": False,
+                "loaded": False,
+                "loading": False,
+                "model": None,
+                "elapsed_ms": 0,
+                "reason": "dense backend unavailable",
+            }
+        wait = _get_bool(params, "wait", True)
+        if wait:
+            try:
+                loaded = bool(backend.ensure_loaded())
+            except Exception as exc:
+                log_event(_kb_root(params), "warn", "warmup failed: %s" % exc)
+                loaded = False
+        else:
+            starter = getattr(backend, "start_warmup", None)
+            if callable(starter):
+                try:
+                    starter()
+                except Exception as exc:
+                    log_event(_kb_root(params), "warn", "warmup failed: %s" % exc)
+            loaded = bool(getattr(backend, "is_loaded", False))
+        return {
+            "ok": True,
+            "dense": True,
+            "loaded": loaded,
+            "loading": bool(getattr(backend, "loading", False)),
+            "model": getattr(backend, "model_name", None),
+            "elapsed_ms": int((time.time() - started) * 1000),
+        }
+
+    def op_stats(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        root = _kb_root(params)
+        manifest = self._load_manifest(root)
+        chunks = self._load_chunks(root)
+        docs = manifest.get("docs") or {}
+        total_bytes = 0
+        for entry in docs.values():
+            try:
+                total_bytes += int(entry.get("size") or 0)
+            except (TypeError, ValueError):
+                continue
+        if total_bytes == 0 and chunks:
+            total_bytes = sum(len((chunk.get("text") or "").encode("utf-8"))
+                              for chunk in chunks)
+        paths = sorted(
+            entry.get("path") for entry in docs.values()
+            if isinstance(entry, dict) and entry.get("path")
+        )
+        missing: List[str] = []
+        superseded: List[str] = []
+        for entry in docs.values():
+            if not isinstance(entry, dict):
+                continue
+            doc_path = entry.get("path")
+            if not doc_path:
+                continue
+            if not os.path.isfile(doc_path):
+                missing.append(doc_path)
+                continue
+            if (doc_path.lower().endswith((".md", ".markdown"))
+                    and _front_matter_status(doc_path) == "superseded"):
+                superseded.append(doc_path)
+        backend, dense_model, capable = self._backend_report()
+        vector_meta = self._vector_meta(root)
+        has_vectors = (os.path.isfile(_child(root, VECTORS_NPY))
+                       or os.path.isfile(_child(root, VECTORS_JSON)))
+        vector_info = None
+        if has_vectors:
+            vector_info = {
+                "count": vector_meta.get("count") or len(chunks),
+                "dim": vector_meta.get("dim"),
+                "model": vector_meta.get("model"),
+                "built_at": vector_meta.get("built_at"),
+            }
+        return {
+            "docs": len(docs),
+            "chunks": len(chunks),
+            "dense": capable,
+            "dense_model": dense_model,
+            "dense_loaded": bool(getattr(self.dense, "is_loaded", False)),
+            "dense_loading": bool(getattr(self.dense, "loading", False)),
+            "dense_lazy": bool(getattr(self.dense, "lazy", False)),
+            "backend": backend,
+            "kb_root": _display_path(root),
+            "bytes": total_bytes,
+            "updated_at": manifest.get("updated_at"),
+            "vectors": vector_info,
+            "paths": paths[:50],
+            "orphaned": len(missing),
+            "orphaned_paths": missing[:20],
+            "superseded": len(superseded),
+            "superseded_paths": superseded[:20],
+            "max_file_mb": _max_file_bytes(params) // (1024 * 1024),
+            "warnings": self._size_warnings(len(chunks), total_bytes, len(missing)),
+        }
+
+    @staticmethod
+    def _size_warnings(chunk_count: int, total_bytes: int, orphaned: int) -> List[str]:
+        warnings: List[str] = []
+        if chunk_count > 50000:
+            warnings.append("chunk count is %d (> 50k); queries stay usable but "
+                            "consider splitting knowledge bases" % chunk_count)
+        if total_bytes > 200 * 1024 * 1024:
+            warnings.append("indexed text is %d MB (> 200 MB)" % (total_bytes // (1024 * 1024)))
+        if orphaned:
+            warnings.append("%d indexed document(s) no longer exist on disk" % orphaned)
+        return warnings
+
+    # -- ingest ------------------------------------------------------------
+    def _parse_file(self, path: str, kind: str,
+                    chunk_cfg: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+        cfg = chunk_cfg or {"chars": MAX_CHUNK_CHARS, "overlap": CHUNK_OVERLAP}
+        max_chars = int(cfg.get("chars") or MAX_CHUNK_CHARS)
+        raw_overlap = cfg.get("overlap")
+        overlap = CHUNK_OVERLAP if raw_overlap is None else int(raw_overlap)
+        if kind == "pdf":
+            title, pages, chunks = chunk_pdf(path, max_chars, overlap)
+        elif kind in ("md", "markdown"):
+            title, chunks = chunk_markdown(_read_text_file(path), _stem(path),
+                                           max_chars, overlap)
+            pages = None
+        elif kind == "txt":
+            title, chunks = chunk_text_plain(_read_text_file(path), _stem(path),
+                                             max_chars, overlap)
+            pages = None
+        elif kind == "docx":
+            doc_title, body = extract_docx(path)
+            title, chunks = _chunk_extracted(doc_title, body, max_chars, overlap)
+            pages = None
+        elif kind in ("html", "htm"):
+            doc_title, body = extract_html(path)
+            title, chunks = _chunk_extracted(doc_title, body, max_chars, overlap)
+            pages = None
+        elif kind == "json":
+            doc_title, body = extract_json(path)
+            title, chunks = _chunk_extracted(doc_title, body, max_chars, overlap)
+            pages = None
+        else:
+            raise KBError("unsupported_extension",
+                          "unsupported file extension: .%s" % kind)
+        return {"title": title, "kind": kind, "pages": pages, "chunks": chunks}
+
+    def op_ingest(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        started = time.time()
+        root = _kb_root(params)
+        raw_paths = params.get("paths")
+        if not isinstance(raw_paths, list) or not raw_paths:
+            raise KBError("bad_request",
+                          "params.paths must be a non-empty array of strings")
+        for item in raw_paths:
+            if not isinstance(item, str):
+                raise KBError("bad_request", "params.paths must contain only strings")
+        recursive = _get_bool(params, "recursive", True)
+        force = _get_bool(params, "force", False)
+        prune = _get_bool(params, "prune", False)
+        max_files = _clamp_int(params.get("max_files"), 50, 1, 100000)
+        with_embeddings = params.get("with_embeddings", "auto")
+        chunk_cfg = _chunk_cfg(params)
+        max_file_bytes = _max_file_bytes(params)
+
+        manifest = self._load_manifest(root)
+        docs_meta: Dict[str, Any] = manifest["docs"]
+        # A legacy index has no "chunk" block: treat it as the defaults, so an
+        # upgrade alone re-chunks nothing, while an explicit different setting does.
+        previous_cfg = manifest.get("chunk") if isinstance(manifest.get("chunk"), dict) else {}
+        previous_chars = int(previous_cfg.get("chars", MAX_CHUNK_CHARS))
+        previous_overlap = int(previous_cfg.get("overlap", CHUNK_OVERLAP))
+        rechunk = (previous_chars != chunk_cfg["chars"]
+                   or previous_overlap != chunk_cfg["overlap"])
+        old_chunks = self._load_chunks(root)
+        by_doc: Dict[str, List[Dict[str, Any]]] = {}
+        for chunk in old_chunks:
+            by_doc.setdefault(chunk["doc_id"], []).append(chunk)
+
+        errors: List[Dict[str, Any]] = []
+        candidates: List[str] = []
+        seen = set()
+        scope_dirs: List[str] = []
+        scope_files: set = set()
+        for raw in raw_paths:
+            path = os.path.abspath(os.path.expanduser(raw))
+            if os.path.isdir(path):
+                scope_dirs.append(os.path.normcase(os.path.abspath(path)))
+                for found in _walk_files(path, recursive):
+                    key = os.path.normcase(os.path.abspath(found))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append(found)
+            elif os.path.isfile(path):
+                if _ext(path) not in SUPPORTED_EXTS:
+                    errors.append({
+                        "path": _display_path(path),
+                        "code": "unsupported_extension",
+                        "message": "unsupported file type: %s" % (_ext(path) or "(none)"),
+                    })
+                    continue
+                key = os.path.normcase(os.path.abspath(path))
+                if key in seen:
+                    continue
+                seen.add(key)
+                scope_files.add(key)
+                candidates.append(path)
+            else:
+                errors.append({
+                    "path": _display_path(path),
+                    "code": "ingest_path_missing",
+                    "message": "path does not exist: %s" % raw,
+                })
+
+        candidates.sort(key=lambda item: item.lower())
+        pending = max(0, len(candidates) - max_files)
+        batch = candidates[:max_files]
+
+        added = 0
+        updated = 0
+        skipped = 0
+        changed = False
+        docs_out: List[Dict[str, Any]] = []
+
+        for path in batch:
+            display = _display_path(path)
+            try:
+                kind = _ext(path).lstrip(".")
+                try:
+                    stat = os.stat(path)
+                except OSError as exc:
+                    raise KBError("ingest_path_missing",
+                                  "cannot stat file: %s" % exc)
+                if stat.st_size > max_file_bytes:
+                    raise KBError(
+                        "file_too_large",
+                        "file is larger than the %d MB limit (set max_file_mb or "
+                        "KB_LITE_MAX_FILE_MB to raise it)"
+                        % (max_file_bytes // (1024 * 1024)),
+                    )
+                digest = _sha256_file(path)
+                doc_id = _doc_id_for(path)
+                previous = docs_meta.get(doc_id)
+                mtime = float(stat.st_mtime)
+                if (previous is not None and not force and not rechunk
+                        and previous.get("sha256") == digest
+                        and int(previous.get("size") or -1) == int(stat.st_size)
+                        and _mtime_same(previous.get("mtime"), mtime)):
+                    skipped += 1
+                    continue
+
+                status = ""
+                if kind in ("md", "markdown"):
+                    status = _front_matter_status(path)
+                parsed = self._parse_file(path, kind, chunk_cfg)
+                doc_chunks: List[Dict[str, Any]] = []
+                for ordinal, chunk in enumerate(parsed["chunks"]):
+                    doc_chunks.append({
+                        "chunk_id": "%s:%d" % (doc_id, ordinal),
+                        "doc_id": doc_id,
+                        "ordinal": ordinal,
+                        "heading": chunk.get("heading"),
+                        "start_line": chunk.get("start_line"),
+                        "end_line": chunk.get("end_line"),
+                        "page": chunk.get("page"),
+                        "text": chunk.get("text", ""),
+                    })
+                by_doc[doc_id] = doc_chunks
+                docs_meta[doc_id] = {
+                    "path": display,
+                    "sha256": digest,
+                    "mtime": round(mtime, 6),
+                    "size": int(stat.st_size),
+                    "title": parsed["title"],
+                    "kind": kind,
+                    "status": status or None,
+                    "pages": parsed["pages"],
+                    "chunks": len(doc_chunks),
+                }
+                if previous is not None:
+                    updated += 1
+                else:
+                    added += 1
+                changed = True
+                docs_out.append({"path": display, "chunks": len(doc_chunks)})
+            except KBError as exc:
+                errors.append({"path": display, "code": exc.code,
+                               "message": exc.message})
+                log_event(root, "warn", "ingest error", path=display,
+                          code=exc.code, message=exc.message)
+            except Exception as exc:
+                errors.append({
+                    "path": display,
+                    "code": "ingest_failed",
+                    "message": "%s: %s" % (type(exc).__name__, exc),
+                })
+                log_event(root, "warn", "ingest failed", path=display,
+                          message=str(exc))
+
+        removed = 0
+        removed_paths: List[str] = []
+        if prune:
+            for doc_id in list(docs_meta.keys()):
+                entry = docs_meta.get(doc_id)
+                stored = entry.get("path") if isinstance(entry, dict) else None
+                if not isinstance(stored, str) or not stored:
+                    continue
+                if os.path.isfile(stored):
+                    continue  # still on disk (possibly pending this batch)
+                normalized = os.path.normcase(os.path.abspath(stored))
+                in_scope = normalized in scope_files or any(
+                    normalized == scope or normalized.startswith(scope + os.sep)
+                    for scope in scope_dirs
+                )
+                if not in_scope:
+                    continue
+                docs_meta.pop(doc_id, None)
+                by_doc.pop(doc_id, None)
+                removed += 1
+                removed_paths.append(_display_path(stored))
+                changed = True
+
+        if not changed and old_chunks and isinstance(with_embeddings, str) \
+                and with_embeddings.strip().lower() in ("on", "true", "1", "yes"):
+            # Backfill vectors on an unchanged BM25-only index (explicit "on").
+            vectors = self._load_vectors(root)
+            if vectors is None or len(vectors) != len(old_chunks):
+                self._sync_vectors(root, old_chunks, old_chunks, with_embeddings)
+
+        if changed:
+            ordered_ids = sorted(
+                by_doc.keys(),
+                key=lambda doc_id: (
+                    (docs_meta.get(doc_id) or {}).get("path") or "", doc_id
+                ),
+            )
+            new_chunks: List[Dict[str, Any]] = []
+            for doc_id in ordered_ids:
+                new_chunks.extend(by_doc[doc_id])
+            self._sync_vectors(root, old_chunks, new_chunks, with_embeddings)
+            self._save_chunks(root, new_chunks)
+            self._save_manifest(root, {
+                "version": MANIFEST_VERSION,
+                "docs": docs_meta,
+                "chunk": chunk_cfg,
+                "updated_at": _now_iso(),
+            })
+
+        elapsed_ms = int((time.time() - started) * 1000)
+        log_event(root, "info", "ingest finished", added=added, updated=updated,
+                  skipped=skipped, removed=removed, errors=len(errors),
+                  pending=pending, elapsed_ms=elapsed_ms)
+        return {
+            "added": added,
+            "updated": updated,
+            "skipped": skipped,
+            "removed": removed,
+            "errors": errors,
+            "pending": pending,
+            "docs": docs_out,
+            "removed_paths": removed_paths[:50],
+            "elapsed_ms": elapsed_ms,
+        }
+
+    # -- retrieval ---------------------------------------------------------
+    def _bm25_scores(self, root: str, chunks: Sequence[Dict[str, Any]],
+                     query: str) -> List[float]:
+        cached = self._index_cache.get(root)
+        if cached is None or cached[0] is not chunks:
+            index = BM25Index([tokenize(chunk.get("text") or "") for chunk in chunks])
+            self._index_cache[root] = (chunks, index)
+        else:
+            index = cached[1]
+        return index.scores(tokenize(query))
+
+    def _phrase_boost(self, manifest: Dict[str, Any],
+                      chunks: Sequence[Dict[str, Any]], query: str) -> List[float]:
+        """Explainable boost: exact phrase in the chunk > in the title > in the path.
+
+        BM25 already rewards term overlap; this only breaks ties toward the
+        document that literally contains what the user typed.
+        """
+        phrase = (query or "").strip().casefold()
+        tokens = [token for token in tokenize(query) if len(token) >= 2]
+        if not phrase:
+            return [1.0] * len(chunks)
+        cache: Dict[str, Tuple[str, str]] = {}
+        boosts: List[float] = []
+        for chunk in chunks:
+            doc_id = chunk.get("doc_id") or ""
+            cached = cache.get(doc_id)
+            if cached is None:
+                doc_path, title = self._doc_info(manifest, doc_id)
+                cached = (doc_path.casefold(), title.casefold())
+                cache[doc_id] = cached
+            path_l, title_l = cached
+            text_l = chunk.get("text_l")
+            if not isinstance(text_l, str):
+                text_l = (chunk.get("text") or "").casefold()
+            boost = 1.0
+            if phrase in text_l:
+                boost += 0.35
+            if phrase in title_l:
+                boost += 0.25
+            elif phrase in path_l:
+                boost += 0.15
+            if tokens and all(token in title_l for token in tokens):
+                boost += 0.10
+            boosts.append(boost)
+        return boosts
+
+    def _retrieve(self, root: str, chunks: Sequence[Dict[str, Any]],
+                  manifest: Dict[str, Any], query: str, top_k: int,
+                  mode: str, weights: Optional[Dict[str, Any]] = None
+                  ) -> Tuple[List[Tuple[int, float, List[str], Dict[str, Any]]], str]:
+        weights = weights or {}
+        w_bm25 = _weight_value(weights.get("bm25"), 1.0)
+        w_dense = _weight_value(weights.get("dense"), 1.0)
+        rrf_k = int(_weight_value(weights.get("rrf_k"), float(RRF_K), minimum=1.0))
+        bm25_scores = self._bm25_scores(root, chunks, query)
+        phrase_boost = self._phrase_boost(manifest, chunks, query)
+        bm25_scores = [score * boost
+                       for score, boost in zip(bm25_scores, phrase_boost)]
+        candidate_limit = max(top_k * 4, top_k)
+        positive = [index for index, score in enumerate(bm25_scores) if score > 0.0]
+        if len(positive) > candidate_limit:
+            bm25_rank = heapq.nlargest(
+                candidate_limit, positive, key=bm25_scores.__getitem__)
+        else:
+            bm25_rank = sorted(positive, key=lambda index: (-bm25_scores[index], index))
+
+        dense_ready = False
+        if mode in ("auto", "dense", "hybrid") and self.dense is not None \
+                and getattr(self.dense, "capable", False):
+            lazy = bool(getattr(self.dense, "lazy", False))
+            if mode == "auto" and lazy \
+                    and not bool(getattr(self.dense, "is_loaded", False)):
+                # Never block the first query on a 14 s model load: answer with
+                # BM25 now and let the model warm up in the background.
+                starter = getattr(self.dense, "start_warmup", None)
+                if callable(starter):
+                    try:
+                        if starter():
+                            log_event(root, "info", "dense warmup started")
+                    except Exception as exc:
+                        log_event(root, "warn", "dense warmup failed: %s" % exc)
+            else:
+                try:
+                    dense_ready = bool(self.dense.ensure_loaded())
+                except Exception as exc:
+                    log_event(root, "warn", "dense backend failed to load: %s" % exc)
+                    dense_ready = False
+
+        if mode == "auto":
+            effective = "hybrid" if dense_ready else "bm25"
+        elif mode == "dense":
+            effective = "dense" if dense_ready else "bm25"
+        elif mode == "hybrid":
+            effective = "hybrid" if dense_ready else "bm25"
+        else:
+            effective = "bm25"
+
+        vector_rows = None
+        if effective in ("dense", "hybrid"):
+            vector_rows = self._load_vectors(root)
+            if vector_rows is None or len(vector_rows) != len(chunks):
+                log_event(root, "warn",
+                          "dense vectors missing or out of sync; using bm25")
+                effective = "bm25"
+                vector_rows = None
+
+        dense_scores: Optional[List[float]] = None
+        dense_rank: List[int] = []
+        if effective in ("dense", "hybrid") and vector_rows is not None:
+            try:
+                query_vector = self.dense.encode(
+                    [BGE_QUERY_PREFIX + query], is_query=True)[0]
+                dense_scores = _dense_dot(vector_rows, query_vector)
+            except Exception as exc:
+                log_event(root, "warn",
+                          "dense query failed (%s); using bm25" % exc)
+                dense_scores = None
+            if dense_scores is None:
+                log_event(root, "warn",
+                          "dense score computation failed; using bm25")
+                effective = "bm25"
+            else:
+                dense_order = sorted(
+                    range(len(chunks)),
+                    key=lambda index: (-dense_scores[index], index),
+                )
+                dense_rank = dense_order[:candidate_limit]
+
+        if effective == "hybrid":
+            fused: Dict[int, float] = {}
+            sources: Dict[int, List[str]] = {}
+            for rank_position, index in enumerate(bm25_rank):
+                fused[index] = fused.get(index, 0.0) + w_bm25 / (rrf_k + rank_position + 1)
+                sources.setdefault(index, []).append("bm25")
+            for rank_position, index in enumerate(dense_rank):
+                fused[index] = fused.get(index, 0.0) + w_dense / (rrf_k + rank_position + 1)
+                sources.setdefault(index, []).append("dense")
+            fused_order = sorted(fused.keys(), key=lambda index: (-fused[index], index))
+            ranked = []
+            for index in fused_order[:max(top_k, RERANK_TOP_N)]:
+                comp = {
+                    "bm25": bm25_scores[index] if bm25_scores[index] > 0.0 else None,
+                    "dense": dense_scores[index] if dense_scores is not None else None,
+                    "rrf": fused[index],
+                    "phrase": phrase_boost[index],
+                }
+                ranked.append((index, fused[index], sources[index], comp))
+            mode_used = "hybrid"
+        elif effective == "dense" and dense_scores is not None:
+            ranked = [(index, dense_scores[index] * w_dense, ["dense"],
+                       {"bm25": bm25_scores[index] if bm25_scores[index] > 0.0 else None,
+                        "dense": dense_scores[index], "rrf": None,
+                        "phrase": phrase_boost[index]})
+                      for index in dense_rank[:max(top_k, RERANK_TOP_N)]]
+            mode_used = "dense"
+        else:
+            ranked = [(index, bm25_scores[index] * w_bm25, ["bm25"],
+                       {"bm25": bm25_scores[index], "dense": None, "rrf": None,
+                        "phrase": phrase_boost[index]})
+                      for index in bm25_rank[:max(top_k, RERANK_TOP_N)]]
+            mode_used = "bm25"
+
+        rerank_cfg = weights.get("rerank")
+        if rerank_cfg and ranked:
+            ranked, applied = self._apply_rerank(root, chunks, query, ranked, rerank_cfg, top_k)
+            if applied:
+                mode_used = mode_used + "+rerank"
+        return ranked[:top_k], mode_used
+
+    def _cross_encoder(self, model_name: str):
+        """Lazy CrossEncoder; cached per model name. None when unavailable."""
+        cache = getattr(self, "_ce_cache", None)
+        if cache is None:
+            cache = {}
+            self._ce_cache = cache
+        if model_name in cache:
+            return cache[model_name]
+        try:
+            from sentence_transformers import CrossEncoder  # type: ignore
+            model = CrossEncoder(model_name)
+        except Exception as exc:
+            _stderr("warn", "reranker unavailable (%r): %s" % (model_name, exc))
+            cache[model_name] = None
+            return None
+        cache[model_name] = model
+        return model
+
+    def _apply_rerank(self, root: str, chunks: Sequence[Dict[str, Any]], query: str,
+                      ranked: List[Tuple[int, float, List[str], Dict[str, Any]]],
+                      cfg: Dict[str, Any], top_k: int
+                      ) -> Tuple[List[Tuple[int, float, List[str], Dict[str, Any]]], bool]:
+        """Cross-encoder score the head of the list; scores are squashed to (0,1)
+        so that the later boost/recency multipliers stay order-preserving."""
+        head = ranked[:max(top_k, int(cfg.get("top_n") or RERANK_TOP_N))]
+        tail = ranked[len(head):]
+        model = self._cross_encoder(cfg.get("model") or RERANK_MODEL)
+        if model is None:
+            return ranked, False
+        try:
+            import math
+            # The cross-encoder truncates at 512 tokens anyway; feeding 1200 chars of
+            # markdown (tables, code fences) measurably hurts ranking, so send the head.
+            pairs = [(query, (chunks[index].get("text") or "")[:RERANK_TEXT_CHARS])
+                     for index, _s, _src, _c in head]
+            raw = model.predict(pairs, show_progress_bar=False)
+            scores = [1.0 / (1.0 + math.exp(-float(x))) for x in raw]
+        except Exception as exc:
+            log_event(root, "warn", "rerank failed: %s" % exc)
+            return ranked, False
+        rescored = []
+        # 纯重排会压掉召回阶段的名次信息：我们这里实测比 hybrid 更差（MRR 0.756 vs 0.886）。
+        # 默认改成"混合"：final = blend*rerank + (1-blend)*归一化后的原分。
+        base = [float(s) for _i, s, _src, _c in head]
+        lo, hi = (min(base), max(base)) if base else (0.0, 0.0)
+
+        def norm(value: float) -> float:
+            return 0.0 if hi == lo else (float(value) - lo) / (hi - lo)
+
+        blend = float(cfg.get("blend", RERANK_BLEND))
+        blend = 0.0 if blend < 0.0 else (1.0 if blend > 1.0 else blend)
+        for (index, original, sources, comp), score in zip(head, scores):
+            mixed = blend * score + (1.0 - blend) * norm(original)
+            item = dict(comp)
+            item["rerank"] = round(score, 6)
+            item["blend"] = round(blend, 3)
+            rescored.append((index, mixed, sources, item))
+        rescored.sort(key=lambda tup: -tup[1])
+        log_event(root, "info", "rerank", candidates=len(head),
+                  model=cfg.get("model"), blend=blend)
+        return rescored + tail, True
+
+    @staticmethod
+    def _doc_info(manifest: Dict[str, Any], doc_id: str) -> Tuple[str, str]:
+        entry = (manifest.get("docs") or {}).get(doc_id) or {}
+        path = entry.get("path") if isinstance(entry, dict) else ""
+        title = entry.get("title") if isinstance(entry, dict) else ""
+        return (path or ""), (title or "")
+
+    @staticmethod
+    def _doc_meta(manifest: Dict[str, Any], doc_id: str) -> Dict[str, Any]:
+        entry = (manifest.get("docs") or {}).get(doc_id) or {}
+        return entry if isinstance(entry, dict) else {}
+
+    def _hit(self, chunk: Dict[str, Any], manifest: Dict[str, Any],
+             score: float, matched_by: Sequence[str],
+             detail: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        path, title = self._doc_info(manifest, chunk.get("doc_id") or "")
+        hit = {
+            "chunk_id": chunk.get("chunk_id"),
+            "doc_id": chunk.get("doc_id"),
+            "path": path,
+            "title": title,
+            "heading": chunk.get("heading"),
+            "start_line": chunk.get("start_line"),
+            "end_line": chunk.get("end_line"),
+            "page": chunk.get("page"),
+            "score": round(float(score), 6),
+            "matched_by": list(matched_by),
+            "snippet": _snippet(chunk.get("text") or ""),
+        }
+        if detail is not None:
+            hit["score_detail"] = detail
+        return hit
+
+    @staticmethod
+    def _detail(comp: Dict[str, Any], boost: float, rule: Optional[str],
+                final: float, recency: float = 1.0,
+                age_days: Optional[float] = None,
+                superseded: bool = False) -> Dict[str, Any]:
+        detail = {
+            "bm25": _round_optional(comp.get("bm25")),
+            "dense": _round_optional(comp.get("dense")),
+            "rrf": _round_optional(comp.get("rrf")),
+            "source_boost": round(float(boost), 4),
+            "boost_rule": rule,
+            "recency": round(float(recency), 4),
+            "age_days": age_days,
+            "superseded": bool(superseded),
+            "final": round(float(final), 6),
+        }
+        if comp.get("phrase") is not None:
+            detail["phrase_boost"] = _round_optional(comp.get("phrase"), 4)
+        if comp.get("rerank") is not None:
+            detail["rerank"] = _round_optional(comp.get("rerank"))
+        return detail
+
+    @staticmethod
+    def _neighbor_map(chunks: Sequence[Dict[str, Any]]
+                      ) -> Dict[int, Tuple[int, List[int]]]:
+        """index -> (position in document, ordered index list of that document)."""
+        by_doc: Dict[str, List[int]] = {}
+        for index, chunk in enumerate(chunks):
+            by_doc.setdefault(chunk.get("doc_id") or "", []).append(index)
+        position: Dict[int, Tuple[int, List[int]]] = {}
+        for indexes in by_doc.values():
+            indexes.sort(key=lambda item: chunks[item].get("ordinal") or 0)
+            for pos, index in enumerate(indexes):
+                position[index] = (pos, indexes)
+        return position
+
+    def op_search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        root = _kb_root(params)
+        query = _require_query(params)
+        top_k = _clamp_int(params.get("top_k"), TOP_K_DEFAULT, 1, TOP_K_MAX)
+        weights = _parse_weights(params.get("weights"))
+        mode = params.get("mode", "auto")
+        if mode is None:
+            mode = "auto"
+        if not isinstance(mode, str) or mode not in ("auto", "bm25", "dense", "hybrid"):
+            raise KBError("bad_request",
+                          "params.mode must be one of auto, bm25, dense, hybrid")
+        chunks = self._load_chunks(root)
+        manifest = self._load_manifest(root)
+        if not chunks:
+            return {"mode_used": "bm25", "hits": []}
+        ranked, mode_used = self._retrieve(root, chunks, manifest, query, top_k,
+                                           mode, weights)
+        include_superseded = _get_bool(params, "include_superseded", False)
+        rows = []
+        for index, score, sources, comp in ranked:
+            chunk = chunks[index]
+            path, _title = self._doc_info(manifest, chunk.get("doc_id") or "")
+            meta = self._doc_meta(manifest, chunk.get("doc_id") or "")
+            mult, rule = _boost_for(path, weights["boost"])
+            rec, age_days = _recency_mult(meta.get("mtime"), weights["recency"])
+            final = float(score) * mult * rec
+            superseded = meta.get("status") == "superseded"
+            if superseded and not include_superseded:
+                final *= SUPERSEDED_WEIGHT
+            rows.append((final, index, sources, comp, mult, rule, rec, age_days, superseded))
+        rows.sort(key=lambda row: -row[0])
+        with_context = _get_bool(params, "context", False)
+        neighbors = self._neighbor_map(chunks) if with_context else None
+        hits = []
+        hit_indexes = []
+        for final, index, sources, comp, mult, rule, rec, age_days, superseded in rows:
+            chunk = chunks[index]
+            hits.append(self._hit(chunk, manifest, final, sources,
+                                  self._detail(comp, mult, rule, final, rec, age_days, superseded)))
+            hit_indexes.append(index)
+        if neighbors is not None:
+            for hit, index in zip(hits, hit_indexes):
+                position, indexes = neighbors[index]
+                context = {"position": position, "count": len(indexes)}
+                if position > 0:
+                    context["before"] = _snippet(chunks[indexes[position - 1]].get("text") or "", 300)
+                if position + 1 < len(indexes):
+                    context["after"] = _snippet(chunks[indexes[position + 1]].get("text") or "", 300)
+                hit["context"] = context
+        log_event(root, "info", "search", query=query[:80], mode=mode_used,
+                  hits=len(hits), top_k=top_k,
+                  w_bm25=weights["bm25"], w_dense=weights["dense"],
+                  boost_rules=len(weights["boost"]))
+        return {"mode_used": mode_used, "hits": hits}
+
+    def op_outline(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        root = _kb_root(params)
+        manifest = self._load_manifest(root)
+        docs = manifest.get("docs") or {}
+        raw_query = params.get("query")
+        query = raw_query.strip().casefold() if isinstance(raw_query, str) else ""
+        limit = _clamp_int(params.get("limit"), 200, 1, 2000)
+        headings: Dict[str, List[str]] = {}
+        for chunk in self._load_chunks(root):
+            doc_id = chunk.get("doc_id")
+            if not isinstance(doc_id, str):
+                continue
+            heading = chunk.get("heading")
+            bucket = headings.setdefault(doc_id, [])
+            if isinstance(heading, str) and heading and heading not in bucket:
+                bucket.append(heading)
+        items: List[Dict[str, Any]] = []
+        for doc_id, entry in docs.items():
+            if not isinstance(entry, dict):
+                continue
+            doc_path = str(entry.get("path") or "")
+            title = str(entry.get("title") or "")
+            if query and query not in doc_path.casefold() and query not in title.casefold():
+                continue
+            items.append({
+                "doc_id": doc_id,
+                "path": doc_path,
+                "title": title,
+                "kind": entry.get("kind"),
+                "size": entry.get("size"),
+                "chunks": entry.get("chunks"),
+                "status": entry.get("status"),
+                "headings": headings.get(doc_id, [])[:20],
+            })
+        items.sort(key=lambda item: (item["path"].casefold(), item["doc_id"]))
+        total = len(items)
+        return {
+            "docs": items[:limit],
+            "total": total,
+            "returned": min(limit, total),
+            "truncated": total > limit,
+        }
+
+    def _document_text(self, root: str, path: str, kind: str,
+                       manifest: Dict[str, Any]) -> str:
+        if kind in ("md", "markdown", "txt"):
+            return _read_text_file(path)
+        if kind == "docx":
+            return extract_docx(path)[1]
+        if kind in ("html", "htm"):
+            return extract_html(path)[1]
+        if kind == "json":
+            return extract_json(path)[1]
+        if kind == "pdf":
+            try:
+                import fitz  # type: ignore
+            except Exception:
+                fitz = None
+            if fitz is not None:
+                try:
+                    parts = []
+                    with fitz.open(path) as document:
+                        for page in document:
+                            parts.append(page.get_text() or "")
+                    return "\n\n".join(parts)
+                except Exception as exc:
+                    log_event(root, "warn", "pdf text extraction failed: %s" % exc)
+            doc_id = ""
+            for candidate_id, entry in (manifest.get("docs") or {}).items():
+                if not isinstance(entry, dict):
+                    continue
+                candidate = entry.get("path")
+                if isinstance(candidate, str) and \
+                        os.path.normcase(os.path.abspath(candidate)) == \
+                        os.path.normcase(os.path.abspath(path)):
+                    doc_id = candidate_id
+                    break
+            if not doc_id:
+                return ""
+            config = manifest.get("chunk") if isinstance(manifest.get("chunk"), dict) else {}
+            overlap = int(config.get("overlap") or CHUNK_OVERLAP)
+            pieces = [item.get("text") or "" for item in sorted(
+                (item for item in self._load_chunks(root) if item.get("doc_id") == doc_id),
+                key=lambda item: int(item.get("ordinal") or 0),
+            )]
+            merged = ""
+            for piece in pieces:
+                if not piece:
+                    continue
+                if not merged:
+                    merged = piece
+                    continue
+                window = min(len(piece), max(overlap, 0) + 64)
+                cut = 0
+                for size in range(window, 0, -1):
+                    if merged.endswith(piece[:size]):
+                        cut = size
+                        break
+                merged += piece[cut:]
+            return merged
+        return ""
+
+    def op_get(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        root = _kb_root(params)
+        manifest = self._load_manifest(root)
+        max_chars = _clamp_int(params.get("max_chars"), 20000, 200, 200000)
+        raw_chunk_id = params.get("chunk_id")
+        if isinstance(raw_chunk_id, str) and raw_chunk_id.strip():
+            wanted_chunk = raw_chunk_id.strip()
+            for chunk in self._load_chunks(root):
+                if chunk.get("chunk_id") != wanted_chunk:
+                    continue
+                doc_path, title = self._doc_info(manifest, chunk.get("doc_id") or "")
+                text = chunk.get("text") or ""
+                return {
+                    "source": "chunk",
+                    "chunk_id": chunk.get("chunk_id"),
+                    "doc_id": chunk.get("doc_id"),
+                    "ordinal": chunk.get("ordinal"),
+                    "path": doc_path,
+                    "title": title,
+                    "heading": chunk.get("heading"),
+                    "start_line": chunk.get("start_line"),
+                    "end_line": chunk.get("end_line"),
+                    "page": chunk.get("page"),
+                    "text": text[:max_chars],
+                    "truncated": len(text) > max_chars,
+                }
+            raise KBError("not_found", "chunk_id is not indexed: %s" % wanted_chunk)
+        raw_path = params.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise KBError("bad_request", "params.path or params.chunk_id is required")
+        wanted = os.path.normcase(os.path.abspath(os.path.expanduser(raw_path.strip())))
+        doc_id = ""
+        entry: Dict[str, Any] = {}
+        for candidate_id, candidate in (manifest.get("docs") or {}).items():
+            if not isinstance(candidate, dict):
+                continue
+            candidate_path = candidate.get("path")
+            if not isinstance(candidate_path, str):
+                continue
+            if os.path.normcase(os.path.abspath(candidate_path)) == wanted:
+                doc_id = candidate_id
+                entry = candidate
+                break
+        if not doc_id:
+            raise KBError("not_found",
+                          "path is not indexed: %s (run kb_outline to list documents)"
+                          % raw_path)
+        doc_path = str(entry.get("path") or "")
+        kind = str(entry.get("kind") or "")
+        try:
+            text = self._document_text(root, doc_path, kind, manifest)
+        except KBError:
+            raise
+        except Exception as exc:
+            raise KBError("read_failed", "cannot read %s: %s" % (doc_path, exc))
+        lines = text.split("\n") if text else []
+        total_lines = len(lines) if lines else (1 if text else 0)
+        if total_lines == 0:
+            return {
+                "source": "document",
+                "doc_id": doc_id,
+                "path": doc_path,
+                "title": entry.get("title") or "",
+                "kind": kind,
+                "total_lines": 0,
+                "start_line": 0,
+                "end_line": 0,
+                "text": "",
+                "truncated": False,
+            }
+        start = _clamp_int(params.get("start_line"), 1, 1, total_lines)
+        raw_end = params.get("end_line")
+        end = total_lines if raw_end is None else _clamp_int(raw_end, total_lines, 1, total_lines)
+        if end < start:
+            end = start
+        body = "\n".join(lines[start - 1:end])
+        return {
+            "source": "document",
+            "doc_id": doc_id,
+            "path": doc_path,
+            "title": entry.get("title") or "",
+            "kind": kind,
+            "total_lines": total_lines,
+            "start_line": start,
+            "end_line": end,
+            "text": body[:max_chars],
+            "truncated": len(body) > max_chars,
+        }
+
+    def op_ask(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        root = _kb_root(params)
+        query = _require_query(params)
+        top_k = _clamp_int(params.get("top_k"), ASK_TOP_K_DEFAULT, 1, TOP_K_MAX)
+        budget = _clamp_int(params.get("max_chars"), MAX_CHARS_DEFAULT,
+                            MAX_CHARS_MIN, MAX_CHARS_MAX)
+        weights = _parse_weights(params.get("weights"))
+        mode = params.get("mode", "auto")
+        if mode is None:
+            mode = "auto"
+        if not isinstance(mode, str) or mode not in ("auto", "bm25", "dense", "hybrid"):
+            raise KBError("bad_request",
+                          "params.mode must be one of auto, bm25, dense, hybrid")
+        chunks = self._load_chunks(root)
+        manifest = self._load_manifest(root)
+        if not chunks:
+            return {"evidence": [], "total_chars": 0, "mode_used": "bm25"}
+        ranked, mode_used = self._retrieve(root, chunks, manifest, query, top_k,
+                                           mode, weights)
+        include_superseded = _get_bool(params, "include_superseded", False)
+        rows = []
+        for index, score, _sources, comp in ranked:
+            chunk = chunks[index]
+            path, _title = self._doc_info(manifest, chunk.get("doc_id") or "")
+            meta = self._doc_meta(manifest, chunk.get("doc_id") or "")
+            mult, rule = _boost_for(path, weights["boost"])
+            rec, age_days = _recency_mult(meta.get("mtime"), weights["recency"])
+            final = float(score) * mult * rec
+            superseded = meta.get("status") == "superseded"
+            if superseded and not include_superseded:
+                final *= SUPERSEDED_WEIGHT
+            rows.append((final, index, comp, mult, rule, rec, age_days, superseded))
+        rows.sort(key=lambda row: -row[0])
+        evidence: List[Dict[str, Any]] = []
+        used = 0
+        for final, index, comp, mult, rule, rec, age_days, superseded in rows:
+            remaining = budget - used
+            if remaining <= 0:
+                break
+            chunk = chunks[index]
+            text = chunk.get("text") or ""
+            if not text:
+                continue
+            if len(text) > remaining:
+                text = text[:remaining]
+                if not text.strip():
+                    continue
+            path, title = self._doc_info(manifest, chunk.get("doc_id") or "")
+            evidence.append({
+                "path": path,
+                "title": title,
+                "heading": chunk.get("heading"),
+                "start_line": chunk.get("start_line"),
+                "end_line": chunk.get("end_line"),
+                "page": chunk.get("page"),
+                "score": round(final, 6),
+                "score_detail": self._detail(comp, mult, rule, final, rec, age_days, superseded),
+                "text": text,
+            })
+            used += len(text)
+        log_event(root, "info", "ask", query=query[:80], mode=mode_used,
+                  evidence=len(evidence), total_chars=used, budget=budget)
+        return {"evidence": evidence, "total_chars": used, "mode_used": mode_used}
+
+    @staticmethod
+    def _discover_index_roots(base: str) -> List[str]:
+        roots: List[str] = []
+        if os.path.isfile(_child(base, MANIFEST_NAME)):
+            roots.append(base)
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [name for name in dirnames
+                           if name not in (".git", "node_modules", "__pycache__")]
+            depth = dirpath[len(base):].count(os.sep)
+            if depth >= 4:
+                dirnames[:] = []
+            if dirpath != base and MANIFEST_NAME in filenames:
+                roots.append(dirpath)
+        return roots
+
+    def op_watch(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """One sweep over every index under kb_root: refresh changed docs,
+        flag vanished ones, and ingest new files sitting next to known docs.
+
+        Called on a timer by the plugin; intentionally synchronous so it shares
+        no state with requests (no manifest write races).
+        """
+        started = time.time()
+        base = _kb_root(params)
+        roots = self._discover_index_roots(base)
+        refreshed: List[Dict[str, Any]] = []
+        added: List[Dict[str, Any]] = []
+        missing: List[str] = []
+        for root in roots:
+            manifest = self._load_manifest(root)
+            docs = manifest.get("docs") or {}
+            changed: List[str] = []
+            known = set()
+            manifest_dirty = False
+            for entry in docs.values():
+                if not isinstance(entry, dict):
+                    continue
+                doc_path = entry.get("path")
+                if not doc_path:
+                    continue
+                known.add(os.path.normcase(os.path.abspath(doc_path)))
+                if not os.path.isfile(doc_path):
+                    if entry.get("status") != "missing":
+                        entry["status"] = "missing"
+                        manifest_dirty = True
+                        missing.append(doc_path)
+                    continue
+                try:
+                    stat = os.stat(doc_path)
+                except OSError:
+                    continue
+                if (int(entry.get("size") or -1) != int(stat.st_size)
+                        or not _mtime_same(entry.get("mtime"), stat.st_mtime)):
+                    changed.append(doc_path)
+            if manifest_dirty:
+                self._save_manifest(root, manifest)
+            if changed:
+                try:
+                    result = self.op_ingest({"kb_root": root, "paths": changed,
+                                             "force": True})
+                    refreshed.append({
+                        "root": _display_path(root),
+                        "paths": [_display_path(path) for path in changed[:20]],
+                        "updated": result.get("updated", 0),
+                        "errors": result.get("errors", []),
+                    })
+                except Exception as exc:
+                    log_event(root, "warn", "watch refresh failed: %s" % exc)
+            new_paths: List[str] = []
+            dirs = {os.path.dirname(os.path.abspath(path)) for path in known}
+            for directory in list(dirs)[:50]:
+                try:
+                    with os.scandir(directory) as entries:
+                        for item in entries:
+                            if not item.is_file():
+                                continue
+                            if _ext(item.name) not in SUPPORTED_EXTS:
+                                continue
+                            key = os.path.normcase(os.path.abspath(item.path))
+                            if key not in known:
+                                new_paths.append(item.path)
+                except OSError:
+                    continue
+            if new_paths:
+                try:
+                    result = self.op_ingest({"kb_root": root, "paths": new_paths,
+                                             "recursive": False})
+                    added.append({"root": _display_path(root),
+                                  "added": result.get("added", 0)})
+                except Exception as exc:
+                    log_event(root, "warn", "watch add failed: %s" % exc)
+        return {
+            "roots": len(roots),
+            "refreshed": refreshed,
+            "added": added,
+            "missing": [_display_path(path) for path in missing[:20]],
+            "elapsed_ms": int((time.time() - started) * 1000),
+        }
+
+    def op_clear(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        root = _kb_root(params)
+        if params.get("confirm") is not True:
+            raise KBError("confirm_required",
+                          "clear requires params.confirm === true")
+        manifest = self._load_manifest(root)
+        removed_docs = len(manifest.get("docs") or {})
+        for name in (MANIFEST_NAME, CHUNKS_NAME, VECTORS_NPY, VECTORS_JSON,
+                     VECTORS_META):
+            path = _child(root, name)
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except OSError as exc:
+                log_event(root, "warn", "cannot remove %s: %s" % (name, exc))
+        self._chunk_cache.pop(root, None)
+        self._index_cache.pop(root, None)
+        log_event(root, "info", "clear finished", removed_docs=removed_docs,
+                  kb_root=_display_path(root))
+        return {"cleared": True, "removed_docs": removed_docs}
+
+
+# --------------------------------------------------------------------------
+# NDJSON server loop
+# --------------------------------------------------------------------------
+def _write_line(stream: Any, payload: Dict[str, Any]) -> None:
+    try:
+        line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
+                          default=str)
+    except (TypeError, ValueError):
+        line = json.dumps(payload, ensure_ascii=True, separators=(",", ":"),
+                          default=str)
+    stream.write(line + "\n")
+    stream.flush()
+
+
+def _handle_line(engine: KBEngine, line: str) -> Dict[str, Any]:
+    try:
+        request = json.loads(line)
+    except ValueError as exc:
+        _stderr("warn", "malformed JSON request: %s" % exc)
+        return {"id": None, "ok": False,
+                "error": {"code": "bad_request",
+                          "message": "malformed JSON request: %s" % exc}}
+    try:
+        return engine.handle_request(request)
+    except Exception as exc:  # defensive: handle_request should never raise
+        _stderr("error", "unhandled request failure: %s" % exc)
+        return {"id": None, "ok": False,
+                "error": {"code": "internal_error",
+                          "message": "%s: %s" % (type(exc).__name__, exc)}}
+
+
+def _configure_stdio() -> None:
+    """Force UTF-8 on stdin/stdout/stderr and LF-only stdout newlines."""
+    try:
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace", newline="\n")
+    except Exception:
+        pass
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
+def serve(stdin: Any = None, stdout: Any = None,
+          engine: Optional[KBEngine] = None) -> int:
+    """Run the NDJSON loop until stdin closes."""
+    stdin = stdin if stdin is not None else sys.stdin
+    stdout = stdout if stdout is not None else sys.stdout
+    engine = engine if engine is not None else KBEngine()
+    _write_line(stdout, engine.ready_event())
+    while True:
+        try:
+            line = stdin.readline()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            _stderr("error", "cannot read stdin: %s" % exc)
+            break
+        if line == "":
+            break
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("\ufeff"):
+            line = line.lstrip("\ufeff")
+        response = _handle_line(engine, line)
+        try:
+            _write_line(stdout, response)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            _stderr("error", "cannot write stdout: %s" % exc)
+            break
+    return 0
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    del argv
+    _configure_stdio()
+    try:
+        return serve()
+    except KeyboardInterrupt:
+        return 0
+    except Exception as exc:
+        _stderr("error", "engine crashed: %s\n%s" % (exc, traceback.format_exc()))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

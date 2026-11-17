@@ -1,0 +1,5 @@
+# dsh-pure-search bundle patch: insert the Host plugin row into the profile.
+# Host-only plugin: no client entry, no front-end injection.
+- insert:
+    - id: pure-search
+      name: dsh-pure-search
