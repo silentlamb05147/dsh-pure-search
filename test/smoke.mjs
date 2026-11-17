@@ -1,4 +1,4 @@
-// Portable smoke test for dsh-pure-search: no DSH, no network.
+// Portable smoke test for dsh-kb-lite-local: no DSH, no network.
 // Run: node test/smoke.mjs
 import fs from 'node:fs'
 import os from 'node:os'

@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.dirname(here)
-const scripts = ['test/smoke.mjs', 'test-layers.mjs']
+const scripts = ['test/smoke.mjs', 'test-layers.mjs', 'test/section-rerank.mjs', 'test/chapter.mjs']
 let failed = 0
 
 for (const script of scripts) {

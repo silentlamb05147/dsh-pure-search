@@ -10,21 +10,13 @@ const backupFlag = args.indexOf('--backup')
 const backup =
   backupFlag >= 0 && args[backupFlag + 1]
     ? path.resolve(args[backupFlag + 1])
-    : process.env.KB_LITE_BACKUP
-      ? path.resolve(process.env.KB_LITE_BACKUP)
-      : null
+    : path.join('E:', path.sep, 'dsh-tools', 'backups', 'kb-lite', '0.4.11-original-20261112')
 
-const work = fs.mkdtempSync(path.join(os.tmpdir(), 'pure-search-restore-'))
+const work = fs.mkdtempSync(path.join(os.tmpdir(), 'kb-lite-restore-'))
 let failures = 0
 const check = (label, ok, detail) => {
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${label}${detail ? ` — ${detail}` : ''}`)
   if (!ok) failures += 1
-}
-
-if (!backup) {
-  console.log('skip restore drill: pass --backup <dir> or set KB_LITE_BACKUP')
-  console.log('FAIL restore drill (no backup given)')
-  process.exit(1)
 }
 
 function copyTree(source, target) {

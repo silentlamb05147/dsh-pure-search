@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""NDJSON knowledge-base engine for the dsh-pure-search DeepSeek Harness plugin.
+"""NDJSON knowledge-base engine for the dsh-kb-lite DeepSeek Harness plugin.
 
 The wire contract lives in ``PROTOCOL.md`` next to this file.  In short:
 
@@ -301,6 +301,12 @@ def _max_file_bytes(params: Dict[str, Any]) -> int:
     if mb <= 0:
         mb = 20
     return mb * 1024 * 1024
+
+
+def _section_rerank_enabled(params: Dict[str, Any]) -> bool:
+    env = os.environ.get("KB_LITE_SECTION_RERANK", "1").strip().lower()
+    default = env not in ("0", "false", "off", "no")
+    return _get_bool(params, "section_rerank", default)
 
 
 def _clamp_int(value: Any, default: int, low: int, high: int) -> int:
@@ -710,11 +716,58 @@ def chunk_markdown(text: str,
     return title, chunks
 
 
+_CHAPTER_PATTERNS: Tuple[re.Pattern, ...] = (
+    re.compile(r"^第\s*[0-9０-９一二三四五六七八九十百千零〇两]+\s*[卷章节回篇部集]"),
+    re.compile(r"^卷\s*[0-9０-９一二三四五六七八九十百千零〇两]+"),
+    re.compile(r"^[0-9]{1,4}\s*[.、．]\s*\S"),
+)
+_VOLUME_TAIL_RE = re.compile(r"^[\u4e00-\u9fffA-Za-z（）()·]{2,14}(纪|传|志|载记|表|书)$")
+
+
+def _normalize_heading_text(text: str) -> str:
+    """Lowercase and drop whitespace/punctuation so "第140章：书名" matches "第140章 书名"."""
+    folded = (text or "").casefold()
+    return re.sub(r"[\s\u3000:：、，,。.;；·\-—_/\\|（）()\[\]【】《》“”\"'‘’!?！？]+", "", folded)
+
+
+def _detect_chapter(line: str) -> Optional[str]:
+    """Return a chapter-like standalone line (第N章 / 卷N / 谢安传), else None."""
+    text = (line or "").strip().lstrip("\ufeff")
+    if not text or len(text) > 40:
+        return None
+    if any(ch in text for ch in "。！？；"):
+        return None
+    for pattern in _CHAPTER_PATTERNS:
+        if pattern.match(text):
+            return text[:120]
+    if (len(text) <= 14 and not any(ch in text for ch in "，、,：:")
+            and _VOLUME_TAIL_RE.match(text)):
+        return text
+    return None
+
+
+def _chapter_marks(text: str) -> List[Tuple[int, int, str]]:
+    """(char_offset, 1-based line, title) for each chapter-like line."""
+    marks: List[Tuple[int, int, str]] = []
+    offset = 0
+    for line_no, line in enumerate(text.splitlines(keepends=True), 1):
+        title = _detect_chapter(line)
+        if title:
+            marks.append((offset, line_no, title))
+        offset += len(line)
+    return marks
+
+
 def chunk_text_plain(text: str,
                      fallback_title: Optional[str] = None,
                      max_chars: int = MAX_CHUNK_CHARS,
                      overlap: int = CHUNK_OVERLAP) -> Tuple[str, List[Dict[str, Any]]]:
-    """Chunk plain text: paragraphs merged greedily up to max_chars, with overlap."""
+    """Chunk plain text: split at chapter lines, then greedily up to max_chars.
+
+    A book is chunked inside one chapter at a time, so a chunk's heading is the
+    chapter it actually belongs to (not whatever chapter happened to start
+    earlier). Files without chapter lines keep the old paragraph-greedy path.
+    """
     body = text or ""
     title = None
     for line in body.split("\n"):
@@ -723,22 +776,41 @@ def chunk_text_plain(text: str,
             break
     if not title:
         title = fallback_title or "Untitled"
+    chapter_lines = _chapter_marks(body)
 
     chunks: List[Dict[str, Any]] = []
     if body.strip():
         newlines = _line_numbers(body)
-        for start, end in split_offsets(body, max_chars, overlap):
-            piece = _span_chunk(body, newlines, 1, start, end)
-            if piece is None:
+        if chapter_lines:
+            bounds: List[Tuple[int, int, str]] = []
+            if chapter_lines[0][0] > 0:
+                bounds.append((0, chapter_lines[0][0], title))
+            for position, (offset, _, chapter_title) in enumerate(chapter_lines):
+                end = (chapter_lines[position + 1][0]
+                       if position + 1 < len(chapter_lines) else len(body))
+                bounds.append((offset, end, chapter_title))
+        else:
+            bounds = [(0, len(body), title)]
+        for segment_start, segment_end, segment_title in bounds:
+            if segment_end <= segment_start:
                 continue
-            piece_text, start_line, end_line = piece
-            chunks.append({
-                "heading": title,
-                "start_line": start_line,
-                "end_line": end_line,
-                "page": None,
-                "text": piece_text,
-            })
+            segment = body[segment_start:segment_end]
+            if not segment.strip():
+                continue
+            for relative_start, relative_end in split_offsets(segment, max_chars, overlap):
+                start = segment_start + relative_start
+                end = segment_start + relative_end
+                piece = _span_chunk(body, newlines, 1, start, end)
+                if piece is None:
+                    continue
+                piece_text, start_line, end_line = piece
+                chunks.append({
+                    "heading": segment_title,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "page": None,
+                    "text": piece_text,
+                })
     return title, chunks
 
 
@@ -1323,6 +1395,10 @@ class KBEngine:
         self._chunk_cache: Dict[str, Tuple[Tuple[int, int],
                                            List[Dict[str, Any]]]] = {}
         self._index_cache: Dict[str, Tuple[Any, "BM25Index"]] = {}
+        # Tokenising a large book costs far more than scoring it; keep the
+        # per-chunk tokens and the per-document section index across queries.
+        self._token_cache: Dict[str, List[str]] = {}
+        self._section_cache: Dict[str, Tuple[int, "BM25Index"]] = {}
 
     # -- backend reporting -------------------------------------------------
     def _backend_report(self) -> Tuple[str, Optional[str], bool]:
@@ -1889,6 +1965,8 @@ class KBEngine:
 
         manifest = self._load_manifest(root)
         docs_meta: Dict[str, Any] = manifest["docs"]
+        self._token_cache.clear()
+        self._section_cache.clear()
         # A legacy index has no "chunk" block: treat it as the defaults, so an
         # upgrade alone re-chunks nothing, while an explicit different setting does.
         previous_cfg = manifest.get("chunk") if isinstance(manifest.get("chunk"), dict) else {}
@@ -2110,6 +2188,9 @@ class KBEngine:
         if not phrase:
             return [1.0] * len(chunks)
         cache: Dict[str, Tuple[str, str]] = {}
+        query_tokens = set(tokens)
+        query_norm = _normalize_heading_text(phrase)
+        heading_boost_weight = float(os.environ.get("KB_LITE_HEADING_BOOST", "0"))
         boosts: List[float] = []
         for chunk in chunks:
             doc_id = chunk.get("doc_id") or ""
@@ -2131,12 +2212,146 @@ class KBEngine:
                 boost += 0.15
             if tokens and all(token in title_l for token in tokens):
                 boost += 0.10
+            heading_l = (chunk.get("heading") or "").casefold()
+            # The user literally names the section ("谢安传", "第140章 玻璃珠换花魁"):
+            # that is a section identifier, not loose wording, so it outweighs
+            # term-frequency noise from other sections of the same book.
+            heading_norm = _normalize_heading_text(heading_l)
+            if len(heading_norm) >= 2 and heading_norm in query_norm:
+                boost += 1.2
+            if heading_boost_weight > 0 and query_tokens:
+                heading_tokens = [token for token in tokenize(heading_l) if len(token) >= 2]
+                if heading_tokens:
+                    overlap = sum(1 for token in heading_tokens if token in query_tokens)
+                    if overlap:
+                        boost += heading_boost_weight * overlap / len(heading_tokens)
             boosts.append(boost)
         return boosts
 
+    def _identity_tokens(self, manifest: Dict[str, Any], doc_id: str) -> set:
+        """Tokens that identify the document, not the section that answers.
+
+        A product code in the query is how the user names a document; it carries
+        no section signal. Leaving it in the section-level query keeps rewarding
+        the boilerplate block that repeats the code (e.g. 适用范围) over the block
+        that actually answers the question.
+        """
+        doc_path, title = self._doc_info(manifest, doc_id)
+        blob = ("%s %s" % (title or "", doc_path or "")).casefold()
+        return {token for token in tokenize(blob) if len(token) >= 2}
+
+    def _chunk_tokens(self, chunk: Dict[str, Any]) -> List[str]:
+        key = chunk.get("chunk_id")
+        if isinstance(key, str) and key:
+            cached = self._token_cache.get(key)
+            if cached is not None:
+                return cached
+        # The section heading is part of the section: index it too, otherwise a
+        # query that names the chapter ("第140章 玻璃珠换花魁") cannot reach the
+        # chunk whose heading carries that title (the title line is stripped
+        # from the chunk body during ingest).
+        heading = chunk.get("heading") or ""
+        text = chunk.get("text") or ""
+        tokens = tokenize("%s\n%s" % (heading, text) if heading else text)
+        if isinstance(key, str) and key:
+            self._token_cache[key] = tokens
+        return tokens
+
+    def _section_order(self, chunks: Sequence[Dict[str, Any]],
+                       indexes: Sequence[int], residual: Sequence[str],
+                       doc_key: Optional[str] = None, query: str = ""
+                       ) -> List[Tuple[int, float]]:
+        """Order one document's chunks by how likely each one answers the question."""
+        if len(indexes) <= 1 or not residual:
+            return [(int(chunk_index), 0.0) for chunk_index in indexes]
+        cached = self._section_cache.get(doc_key) if doc_key else None
+        if cached is not None and cached[0] == len(indexes):
+            index = cached[1]
+        else:
+            index = BM25Index([self._chunk_tokens(chunks[i]) for i in indexes])
+            if doc_key:
+                self._section_cache[doc_key] = (len(indexes), index)
+        scores = index.scores(list(residual))
+        residual_set = set(residual)
+        query_norm = _normalize_heading_text(query)
+        entries: List[Tuple[bool, float, int]] = []
+        for pos, chunk_index in enumerate(indexes):
+            heading = chunks[chunk_index].get("heading") or ""
+            heading_tokens = {token for token in tokenize(heading) if len(token) >= 2}
+            bonus = 0.0
+            if heading_tokens:
+                overlap = len(heading_tokens & residual_set)
+                if overlap:
+                    bonus = 0.6 * overlap / len(heading_tokens)
+            # A query that literally names this section ("谢安传", "第140章 …")
+            # should win the section order regardless of body term frequencies.
+            heading_norm = _normalize_heading_text(heading)
+            matched = len(heading_norm) >= 2 and heading_norm in query_norm
+            entries.append((matched, scores[pos] + bonus, chunk_index))
+        # Named sections come first in document order (chapter start first), the
+        # rest follow by score: a long chunk inside the named chapter must not
+        # outrank the chapter's opening chunk merely by having more words.
+        entries.sort(key=lambda entry: (0 if entry[0] else 1,
+                                         entry[2] if entry[0] else -entry[1],
+                                         entry[2]))
+        return [(chunk_index, score) for _, score, chunk_index in entries]
+
+    def _rerank_sections(self, manifest: Dict[str, Any],
+                         chunks: Sequence[Dict[str, Any]], query: str,
+                         ranked: List[Tuple[int, float, List[str], Dict[str, Any]]],
+                         top_k: int, root: str = ""
+                         ) -> List[Tuple[int, float, List[str], Dict[str, Any]]]:
+        """Keep the document order, let each document surface its best section."""
+        groups: Dict[str, List[Tuple[int, float, List[str], Dict[str, Any]]]] = {}
+        for item in ranked:
+            doc_id = chunks[item[0]].get("doc_id") or ""
+            groups.setdefault(doc_id, []).append(item)
+        if not groups:
+            return ranked
+        doc_indexes: Dict[str, List[int]] = {}
+        for chunk_index, chunk in enumerate(chunks):
+            doc_indexes.setdefault(chunk.get("doc_id") or "", []).append(chunk_index)
+        per_doc: List[List[Tuple[int, float, List[str], Dict[str, Any]]]] = []
+        for doc_rank, (doc_id, items) in enumerate(list(groups.items())[:top_k], 1):
+            identity = self._identity_tokens(manifest, doc_id)
+            residual = [token for token in tokenize(query)
+                        if len(token) >= 2 and token not in identity]
+            candidates = doc_indexes.get(doc_id) or [item[0] for item in items]
+            order = self._section_order(chunks, candidates, residual, "%s::%s" % (root, doc_id), query)
+            by_index = {item[0]: item for item in items}
+            ordered = []
+            for section_rank, (chunk_index, section_score) in enumerate(order, 1):
+                item = by_index.get(chunk_index)
+                if item is None:
+                    index, score, sources, comp = chunk_index, float(section_score), [], \
+                        {"bm25": round(float(section_score), 4)}
+                else:
+                    index, score, sources, comp = item
+                detail = dict(comp)
+                detail["doc_rank"] = doc_rank
+                detail["section_rank"] = section_rank
+                ordered.append((index, score, sources, detail))
+            per_doc.append(ordered)
+        merged: List[Tuple[int, float, List[str], Dict[str, Any]]] = []
+        depth = 0
+        while len(merged) < top_k and any(depth < len(group) for group in per_doc):
+            for group in per_doc:
+                if depth < len(group):
+                    merged.append(group[depth])
+                    if len(merged) >= top_k:
+                        break
+            depth += 1
+        out: List[Tuple[int, float, List[str], Dict[str, Any]]] = []
+        for position, (index, score, sources, comp) in enumerate(merged):
+            detail = dict(comp)
+            detail["order"] = position
+            out.append((index, float(score) - 1e-6 * position, sources, detail))
+        return out
+
     def _retrieve(self, root: str, chunks: Sequence[Dict[str, Any]],
                   manifest: Dict[str, Any], query: str, top_k: int,
-                  mode: str, weights: Optional[Dict[str, Any]] = None
+                  mode: str, weights: Optional[Dict[str, Any]] = None,
+                  section_rerank: bool = True
                   ) -> Tuple[List[Tuple[int, float, List[str], Dict[str, Any]]], str]:
         weights = weights or {}
         w_bm25 = _weight_value(weights.get("bm25"), 1.0)
@@ -2255,6 +2470,8 @@ class KBEngine:
             ranked, applied = self._apply_rerank(root, chunks, query, ranked, rerank_cfg, top_k)
             if applied:
                 mode_used = mode_used + "+rerank"
+        if section_rerank and ranked:
+            ranked = self._rerank_sections(manifest, chunks, query, ranked, top_k, root)
         return ranked[:top_k], mode_used
 
     def _cross_encoder(self, model_name: str):
@@ -2372,6 +2589,9 @@ class KBEngine:
             detail["phrase_boost"] = _round_optional(comp.get("phrase"), 4)
         if comp.get("rerank") is not None:
             detail["rerank"] = _round_optional(comp.get("rerank"))
+        if comp.get("doc_rank") is not None:
+            detail["doc_rank"] = comp.get("doc_rank")
+            detail["section_rank"] = comp.get("section_rank")
         return detail
 
     @staticmethod
@@ -2403,8 +2623,10 @@ class KBEngine:
         manifest = self._load_manifest(root)
         if not chunks:
             return {"mode_used": "bm25", "hits": []}
+        section_rerank = _section_rerank_enabled(params)
         ranked, mode_used = self._retrieve(root, chunks, manifest, query, top_k,
-                                           mode, weights)
+                                           mode, weights,
+                                           section_rerank=section_rerank)
         include_superseded = _get_bool(params, "include_superseded", False)
         rows = []
         for index, score, sources, comp in ranked:
@@ -2419,6 +2641,10 @@ class KBEngine:
                 final *= SUPERSEDED_WEIGHT
             rows.append((final, index, sources, comp, mult, rule, rec, age_days, superseded))
         rows.sort(key=lambda row: -row[0])
+        if section_rerank:
+            # Preserve the round-robin document/section order from _rerank_sections;
+            # a plain score sort would put the code-heavy boilerplate block back first.
+            rows.sort(key=lambda row: row[3].get("order", 10 ** 6))
         with_context = _get_bool(params, "context", False)
         neighbors = self._neighbor_map(chunks) if with_context else None
         hits = []
@@ -2615,6 +2841,41 @@ class KBEngine:
                 "text": "",
                 "truncated": False,
             }
+        raw_chapter = params.get("chapter")
+        if isinstance(raw_chapter, str) and raw_chapter.strip():
+            marks = _chapter_marks(text)
+            wanted = re.sub(r"\s+", "", raw_chapter.strip())
+            picked: Optional[Tuple[int, str]] = None
+            for _, line_no, chapter_title in marks:
+                flat = re.sub(r"\s+", "", chapter_title)
+                if flat == wanted or flat.startswith(wanted) or wanted.startswith(flat):
+                    picked = (line_no, chapter_title)
+                    break
+            if picked is None:
+                raise KBError("not_found",
+                              "chapter not found in %s: %s (try kb_outline first)"
+                              % (_display_path(doc_path), raw_chapter))
+            chapter_start = picked[0]
+            next_start = total_lines + 1
+            for _, line_no, _title in marks:
+                if line_no > chapter_start:
+                    next_start = line_no
+                    break
+            chapter_end = max(chapter_start, next_start - 1)
+            chapter_body = "\n".join(lines[chapter_start - 1:chapter_end])
+            return {
+                "source": "chapter",
+                "doc_id": doc_id,
+                "path": doc_path,
+                "title": entry.get("title") or "",
+                "kind": kind,
+                "chapter": picked[1],
+                "total_lines": total_lines,
+                "start_line": chapter_start,
+                "end_line": chapter_end,
+                "text": chapter_body[:max_chars],
+                "truncated": len(chapter_body) > max_chars,
+            }
         start = _clamp_int(params.get("start_line"), 1, 1, total_lines)
         raw_end = params.get("end_line")
         end = total_lines if raw_end is None else _clamp_int(raw_end, total_lines, 1, total_lines)
@@ -2651,8 +2912,10 @@ class KBEngine:
         manifest = self._load_manifest(root)
         if not chunks:
             return {"evidence": [], "total_chars": 0, "mode_used": "bm25"}
+        section_rerank = _section_rerank_enabled(params)
         ranked, mode_used = self._retrieve(root, chunks, manifest, query, top_k,
-                                           mode, weights)
+                                           mode, weights,
+                                           section_rerank=section_rerank)
         include_superseded = _get_bool(params, "include_superseded", False)
         rows = []
         for index, score, _sources, comp in ranked:
@@ -2667,6 +2930,8 @@ class KBEngine:
                 final *= SUPERSEDED_WEIGHT
             rows.append((final, index, comp, mult, rule, rec, age_days, superseded))
         rows.sort(key=lambda row: -row[0])
+        if section_rerank:
+            rows.sort(key=lambda row: row[2].get("order", 10 ** 6))
         evidence: List[Dict[str, Any]] = []
         used = 0
         for final, index, comp, mult, rule, rec, age_days, superseded in rows:
@@ -2814,6 +3079,8 @@ class KBEngine:
                 log_event(root, "warn", "cannot remove %s: %s" % (name, exc))
         self._chunk_cache.pop(root, None)
         self._index_cache.pop(root, None)
+        self._token_cache.clear()
+        self._section_cache.clear()
         log_event(root, "info", "clear finished", removed_docs=removed_docs,
                   kb_root=_display_path(root))
         return {"cleared": True, "removed_docs": removed_docs}
