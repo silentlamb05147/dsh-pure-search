@@ -1,142 +1,173 @@
 # dsh-pure-search
 
-**Pure-local retrieval for DeepSeek Harness: index Markdown, TXT, PDF, Word, HTML and JSON, store them per-workspace / per-session, and get every hit back with a verifiable citation.**
+**A local document search plugin for DeepSeek Harness: index Markdown, TXT, PDF, DOCX, HTML and JSON into a workspace- and session-scoped local index, and return every hit with a verifiable source location.**
 
 English | [简体中文](README.zh.md)
 
-> Derived from [imaused/dsh-kb-lite](https://github.com/imaused/dsh-kb-lite) (MIT) and rebuilt as an independent project on top of its 0.4.x line: **DOCX / HTML / JSON parsing**, **workspace/session layered index with fallback**, **chapter detection and whole-chapter reads**, **two-stage passage reranking**, **query-path performance work**, and **CI / regression tests**. Fully offline — no network, no model calls, no sockets.
+| Version | License | Runtime |
+|---|---|---|
+| 1.0.0 (2026-11-17) | MIT | DSH 0.2.1-rc.2 / 0.2.2-rc.1; Node.js ≥ 18; Python ≥ 3.9 |
+
+Rebuilt from [imaused/dsh-kb-lite](https://github.com/imaused/dsh-kb-lite) (MIT) at 0.4.x. The tool interface and on-disk index format are preserved; DOCX/HTML/JSON parsing, workspace/session layers, chapter detection and reading, section-level reranking, and retrieval-path performance are new. The plugin runs fully offline: no network requests, no model calls, no listening sockets.
 
 ---
 
-## Why use it (measured)
+## What it solves
 
-| Advantage | Measured | What it means |
+| Problem | Approach | Verifiable result |
 |---|---|---|
-| **Light** | 133 KB engine + 48 KB plugin, Python stdlib only, zero runtime deps | Install is one directory, uninstall is clean; no 2 GB model stack for search |
-| **Fast** | 395 chunks: **2.7 ms** (p95 6.6); 10,000 chunks: **45 ms** (upstream ~1,077 ms) | Day-to-day search costs a fraction of one model turn; still flat at 25× the corpus |
-| **Right passage** | Synthetic 50 docs / 100 questions: answer-in-results **24% → 95%** | Not "right document, wrong paragraph": doc-first, then in-document rerank after stripping identity tokens |
-| **Chapters** | 1.33M-char novel: 1,472 chunks / 438 chapters; 591K-char *Jinshu*: 695 chunks / 130 biographies; `kb_get path+chapter` returns the whole chapter | No more "search, then guess the line number" for long books |
-| **Citations** | Every hit carries `path` / `title` / `heading` / `start_line` / `end_line` / `page` | You can verify the quote at the line level |
-| **No cross-project bleed** | `<workspace>/_shared` and `sessions/<session>`, session-first with explicit fallback | Different projects never see each other's documents or ranks |
-| **No client injection** | No `dsh.client` field; registers 8 host-side tools only | A DSH client-API bump cannot take it down (DSH boots all-or-nothing) |
-| **Maintainable** | Upstream git history and tags kept, 4 test suites + GitHub Actions | Not a one-shot fork; upstream fixes can be merged on demand |
+| The full document does not fit in context | Return only matching passages with line ranges; expand with `kb_get`, or read a whole chapter | 2.7 ms per lookup; every hit carries `path`, `heading`, `start_line` / `end_line` |
+| The same files are re-read every turn | Ingest once; the index stays resident and invalidates on `(mtime, size)` change | 2.7 ms at 395 chunks; 45 ms at 10,000 chunks |
+| Documents from different projects bleed together | Separate workspace-shared and session-private layers; query session first, fall back explicitly | Scores are never mixed; responses include `layer`, `fell_back`, `fallback_reason` |
+| Citations cannot be checked | Every hit includes document path, title, chapter title and 1-based line range | Jump directly to the source lines |
+| The right document, the wrong passage | Two-stage reranking: order documents first, then rescore passages inside each document without the identifying tokens | Answer-bearing passages in results: 24% → 95% on 100 synthetic questions |
+| Long novels or histories have no structure | Detect chapter lines (`第N章/卷/节/回`, `卷N`, `…纪/传/志`), attach chunks to chapters, read a whole chapter | 438 chapters in 1.33M characters; 130 biographies in the 590k-character *Jinshu* |
+| Do not want a plugin that calls out or calls models | Parsing, indexing and retrieval are entirely local | No network, no sockets, no model calls |
+| Worried a DSH upgrade breaks the plugin | Register host-side tools only; no client injection | Not affected by client API changes |
 
-## What problem it solves
+### Suitable / not suitable
 
-Four common pains when feeding documents to a model: context doesn't fit, files are re-read every turn, documents from different projects bleed together, and citations can't be checked.
+**Suitable**: locating exact keywords, quotations, file names, function names and identifiers; building a citable search layer for project docs, specs and notes; chapter lookup in long novels, histories and scripts; isolating documents across projects on one machine; offline and air-gapped environments.
 
-This plugin takes "find the source text" out of the conversation and hands it to a local index:
+**Not suitable**: fuzzy search dominated by paraphrase (current recall 4–6 / 10); answer generation, summarisation or rewriting; scanned PDFs (OCR first); semantic recall without accepting ~2 GB of vector dependencies.
 
-- documents are ingested once, then only the index is queried;
-- Chinese is tokenized into bigrams for BM25, so word order and phrases work — **paraphrases rely on lexical overlap and are limited; that is BM25's ceiling, not a hidden feature**;
-- every hit carries `path`, `title`, `heading`, `start_line/end_line` or `page` for verification;
-- the index is split by workspace and then by session, so projects don't mix.
+## Facts at a glance
 
-## Supported formats
+| Metric | Value | Condition |
+|---|---|---|
+| Per-query latency | median **2.7 ms**, p95 6.6 ms | 395-chunk Chinese corpus, engine reused, index warm |
+| 10k-chunk latency | median **45 ms** | synthetic corpus; upstream implementation 1,077 ms under the same conditions |
+| Literal retrieval | top-1 **10 / 10** | literal questions in a 20-question real-novel set |
+| Semantic retrieval | top-1 **4 / 10**, top-5 **6 / 10** | paraphrase questions in the same set |
+| Passage hit rate | **24% → 95%** | 100 synthetic questions over 50 documents, answer passage in results |
+| Chapter detection | 438 chapters / 130 biographies | 1.33M-character novel; 590k-character *Jinshu* |
+| Ingest time | 132 ms / 746 ms | 8 docs / 376 chunks; 37 docs / 2,013 chunks |
 
-| Format | Parsing | Citation | Notes |
-|---|---|---|---|
-| `.md` / `.markdown` | heading-aware chunking, front-matter aware | title, heading, lines | `status: superseded` is down-weighted |
-| `.txt` | plain-text chunking; detects `Chapter N` / `卷N` / `…纪/传/志` chapter lines | lines, chapter title | falls back to greedy paragraph chunks |
-| `.pdf` | PyMuPDF text extraction | page | scanned PDFs need OCR first |
-| `.docx` | stdlib `zipfile` + `word/document.xml` | title (`dc:title`, else first paragraph) | tables/images flattened to text |
-| `.html` / `.htm` | `HTMLParser`, skipping script/style/noscript/template/svg/canvas | `<title>` | block tags become line breaks |
-| `.json` | recursive flatten to `a.b[0] = value` | key path | depth 8, 2,000 chars/value, 2 MB total |
+## Core features
 
-Directory ingest skips hidden dirs, `.git`, `node_modules`, `.venv`, `__pycache__`. Other extensions are ignored during traversal and reported as `unsupported_extension` when named explicitly.
+| Feature | Description |
+|---|---|
+| Lightweight | 133 KB engine, 48 KB plugin, Python standard library only; no runtime dependencies; install and removal touch a single directory |
+| Low latency | In-process caching; no repeated tokenisation or index rebuilds on the query path |
+| Passage-level ordering | Documents first, passages second, reducing "right document, wrong passage" |
+| Chapter support | Plain-text chapter detection; `kb_get path + chapter` returns a whole chapter with line ranges |
+| Faithful citations | Returns original text and location; no rewriting, summarising or polishing |
+| Layer isolation | Workspace-shared and session-private layers with explicit fallback markers |
+| Host compatibility | No `dsh.client` entry; host tools only |
+| Maintainable | Upstream git history and tags preserved; four test suites and CI |
+
+## Design principles
+
+1. **Offline by default** — retrieval, parsing and indexing make no network calls; optional dense retrieval is off by default.
+2. **Citations over answers** — return source text and location; never generate answers.
+3. **Minimal dependencies** — BM25, tokenisation and DOCX/HTML/JSON parsing use the standard library; only PDF requires PyMuPDF.
+4. **Non-invasive** — no client entry point, no DSH UI changes.
+5. **Predictable behaviour** — layers, fallback, cache invalidation and index state are explicit fields.
 
 ## How it works
 
-**Plugin layer (Node.js, ESM)**: registers eight host-side tools and deliberately omits `dsh.client`, so there is no client injection to break on DSH upgrades.
+**Plugin layer (Node.js, ESM)** — registers eight host tools and performs argument validation, layer-path resolution and tool description. No client code.
 
-**Engine layer (Python 3.9+)**: a child process runs `engine/kb_engine.py` over NDJSON on stdin/stdout. BM25 uses the stdlib only; PDF needs `pymupdf`; dense retrieval needs `numpy` + `sentence-transformers`.
+**Engine layer (Python ≥ 3.9)** — `engine/kb_engine.py` runs as a separate subprocess and speaks NDJSON over stdin/stdout, one JSON response per request.
 
-**Retrieval**: BM25 (CJK bigrams) plus optional dense vectors (`BAAI/bge-small-zh-v1.5`) fused with RRF. After retrieval, a two-stage rerank picks documents first, then re-scores passages inside each document with identity tokens (title/path) removed, and boosts passages whose chapter title is named in the query.
+**Retrieval** — BM25 over Chinese bigrams; optional dense vectors (`BAAI/bge-small-zh-v1.5`) fused with RRF in hybrid mode; per-call weight overrides, `top_k` and `include_superseded`.
 
-**Chapters**: plain-text documents are chunked at chapter lines; `kb_get path + chapter` returns the chapter body with 1-based line ranges. Chapter detection is line-level only (`第N章/卷/节/回/篇/部/集`, `卷N`, `数字. 标题`, `…纪/传/志/载记/表/书`).
+**Section reranking** — after retrieval, documents are ordered by their best passage; inside each document the tokens used to identify it (title, path) are removed from the query, the remaining terms are rescored against that document's passages, and passages matching the chapter heading receive a boost. A chapter named directly in the query (for example `第140章` or `谢安传`) receives additional weight.
 
-**Index and caches**: `manifest.json` stores sha256 and document metadata; `chunks.jsonl` stores text and line ranges; `sync-state.json` / `sync-log.jsonl` record sync state. Chunk lists, token caches and BM25 postings are cached in-process and invalidated by `chunks.jsonl` `(mtime_ns, size)` and `root::doc_id`. `top_k` is exact (no more `max(top_k, 24)`).
+**Index and cache** — `manifest.json` stores file digests and document metadata; `chunks.jsonl` stores text, chapter titles and line ranges; `sync-state.json` and `sync-log.jsonl` record sync state. Chunk lists, tokenisations and the BM25 inverted index are cached in-process and invalidated by the `(mtime_ns, size)` of `chunks.jsonl` and by `root::doc_id`.
 
-**Layering**: `<kb_root>/<workspace>/_shared` for shared documents, `<kb_root>/<workspace>/sessions/<session>` for session-private ones; session first, workspace fallback, scores never mixed, `fell_back` / `fallback_reason` reported. Without `workspace`, the name comes from the session working directory (DSH 0.2.1: `session.header.cwd`).
+**Layers** — `<kb_root>/<workspace>/_shared` holds workspace-shared documents; `<kb_root>/<workspace>/sessions/<session>` holds session-private ones. Queries hit the session layer first, fall back to the workspace layer, and report `layer`, `fell_back` and `fallback_reason`. Without an explicit `workspace`, the workspace name is derived from the current session's working directory.
 
-## Benchmarks
+## Supported formats
 
-Windows machine, Chinese corpora:
+| Format | Parsing | Citation info | Notes |
+|---|---|---|---|
+| `.md` / `.markdown` | Heading-aware chunking; front matter recognised | Title, chapter heading, line range | `status: superseded` documents are down-weighted |
+| `.txt` | Plain-text chunking; chapter lines detected | Line range, chapter title | Paragraph chunking when no chapter lines exist |
+| `.pdf` | Text extraction via PyMuPDF | Page number | Scanned files have no text layer; OCR first |
+| `.docx` | `word/document.xml` parsed with `zipfile` | Title (`dc:title`; first paragraph as fallback) | Tables and images are treated as plain text |
+| `.html` / `.htm` | `HTMLParser`; script/style nodes skipped | `<title>` | Block-level tags become newlines |
+| `.json` | Flattened recursively to `a.b[0] = value` | Key path | Depth limit 8, 2,000 characters per value, 2 MB total |
+
+Recursive ingestion skips hidden directories, `.git`, `node_modules`, `.venv` and `__pycache__`; other extensions are ignored during directory walks and return `unsupported_extension` when named explicitly.
+
+## Tool reference
+
+| Tool | Purpose | Main arguments |
+|---|---|---|
+| `kb_ingest` | Ingest documents | `paths`, `workspace`, `session`, `force`, `prune`, `max_files`, `chunk_chars`, `chunk_overlap`, `max_file_mb`, `with_embeddings` |
+| `kb_search` | Search passages | `query`, `workspace`, `session`, `fallback`, `top_k`, `mode`, `weights`, `include_superseded`, `context` |
+| `kb_ask` | Return evidence and sources | As `kb_search`, plus `max_chars` |
+| `kb_outline` | List documents and headings | `query` (path or title filter), `workspace`, `session`, `limit` |
+| `kb_get` | Read source text by path or chunk ID; read a whole chapter with `path + chapter` | `path`, `chunk_id`, `chapter`, `start_line`, `end_line`, `max_chars` |
+| `kb_stats` | Index statistics and health | `workspace`, `session` |
+| `kb_sync` | Incremental sync | `max_files`, `prune` |
+| `kb_clear` | Clear indexes | `scope`: `session` / `workspace` / `all` |
+
+`kb_ask` returns source passages and locations only; no rewriting, summarising or polishing. Every 30 seconds the plugin lazily scans ingested directories: new and changed files are ingested, deleted files are marked `missing`.
+
+## Performance and accuracy
+
+Measured on a standard Windows desktop with Chinese corpora, warm index and a reused engine process:
 
 | Metric | Result |
 |---|---|
-| 7 docs / 259 KB / 376 chunks, 7 natural-language questions, top-3 | **7 / 7** |
-| Single query (warm process, cached index) | median **2.7 ms**, p95 6.6 ms |
-| 10,000-chunk synthetic corpus, single query | median **45 ms** (upstream 1,077 ms) |
+| 7 docs / 259 KB / 376 chunks, 7 natural-language questions, top-3 | 7 / 7 |
+| Per-query latency | median 2.7 ms, p95 6.6 ms |
+| 10,000-chunk synthetic corpus | median 45 ms (upstream 1,077 ms under the same conditions) |
 | Ingest 8 docs / 376 chunks | 132 ms |
 | Ingest 37 docs / 2,013 chunks | 746 ms |
-| 1.33M-char novel (1,472 chunks / 438 chapters) | first query 3.3 s (cache build); then **16.7 ms** |
-| 591K-char *Jinshu* (695 chunks / 130 biographies) | first query 1.9 s; then **8.8 ms** |
+| 1.33M-character novel (1,472 chunks / 438 chapters) | first query 3.3 s (cache build); median 16.7 ms afterwards |
+| 590k-character *Jinshu* (695 chunks / 130 biographies) | first query 1.9 s; median 8.8 ms afterwards |
 
-**Accuracy** (20 real-novel questions, human-written expected chapters + anchor text):
+Accuracy is measured on 20 real-novel questions with human-labelled expected chapters and anchor passages:
 
 | Question type | top-1 | top-5 |
 |---|---|---|
-| Literal (original wording) | **10 / 10** | 10 / 10 |
-| Semantic (paraphrase) | **4 / 10** | **6 / 10** |
-| Total | 14 / 20 | 16 / 20 |
+| Literal (exact phrase or term) | 10 / 10 | 10 / 10 |
+| Semantic (paraphrase) | 4 / 10 | 6 / 10 |
+| Overall | 14 / 20 | 16 / 20 |
 
-Synthetic set (50 docs / 200 questions, document level): literal `doc@1` 100%, paraphrase `doc@1` 90% — optimistic (high lexical overlap), not a public claim.
+A synthetic set (50 documents / 200 questions, document level) also measured literal `doc@1` at 100% and paraphrase `doc@1` at 90%; question wording overlaps document text heavily, so those numbers are optimistic and are not presented as public claims.
 
-Bottom line: **fast and precise for keywords, original sentences, filenames, constants and identifiers; paraphrased questions land at 4–6/10, which is BM25's ceiling.** Semantic recall needs a ~2 GB dense stack, which is off by default.
+## Installation and upgrade
 
-## Install
-
-From Git (recommended during early release):
+From the git repository:
 
 ```powershell
 dsh plugin --profile desktop add "git+https://github.com/silentlamb05147/dsh-pure-search.git"
 ```
 
-Local development via link:
+For local development, install via link:
 
 ```powershell
-dsh plugin --profile desktop add "link:<your-repo-path>"
+dsh plugin --profile desktop add "link:<repo path>"
 ```
 
-Restart DSH afterwards. Ingest first (tool names keep the `kb_*` prefix for upstream API compatibility):
+Restart DSH after installation. Build an index before first use (tool names keep the `kb_*` prefix for upstream compatibility):
 
 ```json
-{ "paths": ["<your-project>/docs"], "workspace": "my-project" }
+{ "paths": ["<project>/docs"], "workspace": "my-project" }
 ```
 
-## Eight tools
-
-| Tool | Purpose | Key parameters |
-|---|---|---|
-| `kb_ingest` | Ingest documents | `paths`, `workspace`, `session`, `force`, `prune`, `max_files`, `chunk_chars`, `chunk_overlap`, `max_file_mb`, `with_embeddings` |
-| `kb_search` | Search passages | `query`, `workspace`, `session`, `fallback`, `top_k`, `mode`, `weights`, `include_superseded`, `context` |
-| `kb_ask` | Verbatim evidence with citations | same, plus `max_chars` |
-| `kb_outline` | List documents and heading tree | `query` (path/title filter), `workspace`, `session`, `limit` |
-| `kb_get` | Read text by `path` or `chunk_id`; `path + chapter` returns a whole chapter | `path`, `chunk_id`, `chapter`, `start_line`, `end_line`, `max_chars` |
-| `kb_stats` | Index stats and health | `workspace`, `session` |
-| `kb_sync` | Incremental sync | `max_files`, `prune` |
-| `kb_clear` | Clear index | `scope`: `session` / `workspace` / `all` |
-
-`kb_ask` returns verbatim passages and citations only — no rewriting, summarizing or polishing. Every 30 seconds the plugin lazily scans ingested directories: changes and additions are ingested, deletions are marked `missing`.
+To upgrade, run `add` again and restart DSH; the index format is backward compatible and needs no rebuild.
 
 ## Known limitations
 
-- First query after a cold start loads the index (~12 ms; process start ~130 ms); very large single files build caches on first query (1.33M chars ≈ 3.3 s);
-- Paraphrase recall is 4–6/10; dense retrieval is off by default and needs extra dependencies;
-- Scanned PDFs have no text layer and need OCR first;
-- DOCX text only — no tables, images or comments; md/docx heading styles are not treated as chapters (chapters are plain-text line rules only);
-- JSON is flattened, nested values beyond depth 8 are truncated;
-- Fork point and merge strategy: see [UPSTREAM-DIFF.md](UPSTREAM-DIFF.md).
+- The first query after a cold start loads the index (about 12 ms; process start about 130 ms). Very large single files build a cache on first query (about 3.3 s for 1.33M characters).
+- Paraphrase recall is 4–6 / 10. Dense retrieval is off by default and requires about 2 GB of extra dependencies.
+- Scanned PDFs have no text layer and require OCR first.
+- DOCX extraction keeps body text only; tables, images and comments are not preserved. Markdown and DOCX heading styles are not treated as chapters; chapter detection works on plain-text line rules only.
+- JSON is flattened only; nesting deeper than 8 levels is truncated.
+- Divergence from upstream 0.4.x and the merge strategy are documented in [UPSTREAM-DIFF.md](UPSTREAM-DIFF.md).
 
-## Open source and release
+## Development
 
-- **License**: MIT, upstream copyright and LICENSE preserved;
-- **Versioning**: independent from `1.0.0`;
-- **Upstream merges**: not automatic; `git fetch upstream && git merge` on demand — see `UPSTREAM-DIFF.md`;
-- **Compatibility**: validated on DSH 0.2.1-rc.2 / 0.2.2-rc.1, Node.js 18+, Python 3.9+;
-- **Development and tests**: see [DEVELOPMENT.md](DEVELOPMENT.md).
+- Developer notes: [DEVELOPMENT.md](DEVELOPMENT.md);
+- Tests: `node test/run-all.mjs` (smoke, layers, section-rerank, chapter);
+- CI: `.github/workflows/ci.yml`, Ubuntu and Windows, Node 20 and 22;
+- Upstream sync: not automatic; merge on demand with `git fetch upstream && git merge`; conflict hotspots and steps are in `UPSTREAM-DIFF.md`.
 
 ## License
 
-MIT. Derived from [imaused/dsh-kb-lite](https://github.com/imaused/dsh-kb-lite) (MIT); original copyright remains with its author.
+MIT. Derived from [imaused/dsh-kb-lite](https://github.com/imaused/dsh-kb-lite) (MIT); original copyright remains with the original author.
