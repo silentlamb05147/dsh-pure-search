@@ -1,5 +1,7 @@
 # dsh-pure-search
 
+[![ci](https://github.com/silentlamb05147/dsh-pure-search/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/silentlamb05147/dsh-pure-search/actions/workflows/ci.yml)
+
 **面向 DeepSeek Harness 的本地文档检索插件：将 Markdown、TXT、PDF、DOCX、HTML、JSON 纳入本地索引，按工作区与会话分层存储，检索结果附带可核对的原文出处。**
 
 [English](README.md) | 简体中文

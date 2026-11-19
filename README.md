@@ -1,5 +1,7 @@
 # dsh-pure-search
 
+[![ci](https://github.com/silentlamb05147/dsh-pure-search/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/silentlamb05147/dsh-pure-search/actions/workflows/ci.yml)
+
 **A local document search plugin for DeepSeek Harness: index Markdown, TXT, PDF, DOCX, HTML and JSON into a workspace- and session-scoped local index, and return every hit with a verifiable source location.**
 
 English | [简体中文](README.zh.md)
