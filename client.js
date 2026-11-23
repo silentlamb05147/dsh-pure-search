@@ -60,8 +60,16 @@ window.__ModuleLoader__.load({
     };
 
     function layerLabel(doc) {
-      if (doc.layer === 'session') return `会话 · ${doc.session || ''}`;
-      return '工作区';
+      const layers = Array.isArray(doc.layers) ? doc.layers : [];
+      const hasWorkspace = layers.some((item) => item.layer === 'workspace');
+      const sessions = layers.filter((item) => item.layer === 'session');
+      if (!hasWorkspace && sessions.length === 0) return '未知';
+      if (!hasWorkspace) {
+        const names = [...new Set(sessions.map((item) => item.session).filter(Boolean))];
+        return names.length > 1 ? `会话 × ${names.length}` : `会话 · ${names[0] || ''}`;
+      }
+      if (sessions.length === 0) return '工作区';
+      return `工作区 + 会话${sessions.length > 1 ? ` × ${sessions.length}` : ''}`;
     }
 
     function Page() {
@@ -92,7 +100,7 @@ window.__ModuleLoader__.load({
       const remove = useCallback(
         async (doc) => {
           const ok = window.confirm(
-            `从索引中移除「${doc.name}」？\n\n只会删除索引条目，磁盘上的原文件不受影响。`,
+            `从索引中移除「${doc.name}」？\n\n只会删除索引条目，磁盘上的原文件不受影响；它在所有层（工作区 / 会话）中的索引都会被移除。`,
           );
           if (!ok) return;
           setBusy(doc.path);
@@ -101,11 +109,7 @@ window.__ModuleLoader__.load({
             const res = await fetch(`${API}/delete`, {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({
-                path: doc.path,
-                workspace: doc.workspace,
-                session: doc.session,
-              }),
+              body: JSON.stringify({ path: doc.path }),
             });
             const body = await res.json();
             if (!body || body.ok !== true) throw new Error((body && body.error) || '删除失败');
@@ -142,7 +146,7 @@ window.__ModuleLoader__.load({
               docs.map((doc) =>
                 h(
                   'div',
-                  { key: `${doc.layer}:${doc.path}`, style: styles.row },
+                  { key: doc.path, style: styles.row },
                   h(
                     'div',
                     { style: styles.grow },

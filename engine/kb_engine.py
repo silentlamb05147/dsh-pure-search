@@ -3049,30 +3049,35 @@ class KBEngine:
                     })
                 except Exception as exc:
                     log_event(root, "warn", "watch refresh failed: %s" % exc)
+            # Session roots only refresh documents already indexed there. Scanning
+            # their directories for new files would copy every sibling document of
+            # the working directory into each session index.
+            is_session_root = (os.sep + "sessions" + os.sep) in os.path.abspath(root)
             new_paths: List[str] = []
-            dirs = {os.path.dirname(os.path.abspath(path)) for path in known}
-            for directory in list(dirs)[:50]:
-                try:
-                    with os.scandir(directory) as entries:
-                        for item in entries:
-                            if not item.is_file():
-                                continue
-                            if _ext(item.name) not in SUPPORTED_EXTS:
-                                continue
-                            key = os.path.normcase(os.path.abspath(item.path))
-                            if key not in known:
-                                new_paths.append(item.path)
-                except OSError:
-                    continue
-            if new_paths:
-                try:
-                    result = self.op_ingest({"kb_root": root, "paths": new_paths,
-                                             "recursive": False,
-                                             "restore_excluded": False})
-                    added.append({"root": _display_path(root),
-                                  "added": result.get("added", 0)})
-                except Exception as exc:
-                    log_event(root, "warn", "watch add failed: %s" % exc)
+            if not is_session_root:
+                dirs = {os.path.dirname(os.path.abspath(path)) for path in known}
+                for directory in list(dirs)[:50]:
+                    try:
+                        with os.scandir(directory) as entries:
+                            for item in entries:
+                                if not item.is_file():
+                                    continue
+                                if _ext(item.name) not in SUPPORTED_EXTS:
+                                    continue
+                                key = os.path.normcase(os.path.abspath(item.path))
+                                if key not in known:
+                                    new_paths.append(item.path)
+                    except OSError:
+                        continue
+                if new_paths:
+                    try:
+                        result = self.op_ingest({"kb_root": root, "paths": new_paths,
+                                                 "recursive": False,
+                                                 "restore_excluded": False})
+                        added.append({"root": _display_path(root),
+                                      "added": result.get("added", 0)})
+                    except Exception as exc:
+                        log_event(root, "warn", "watch add failed: %s" % exc)
         return {
             "roots": len(roots),
             "refreshed": refreshed,

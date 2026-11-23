@@ -102,7 +102,7 @@ Recursive ingestion skips hidden directories, `.git`, `node_modules`, `.venv` an
 | `kb_ask` | Return evidence and sources | As `kb_search`, plus `max_chars` |
 | `kb_outline` | List documents and headings | `query` (path or title filter), `workspace`, `session`, `limit` |
 | `kb_get` | Read source text by path or chunk ID; read a whole chapter with `path + chapter` | `path`, `chunk_id`, `chapter`, `start_line`, `end_line`, `max_chars` |
-| `kb_delete` | Remove one document from the index (the file stays on disk); `restore: true` re-indexes it | `path`, `restore`, `workspace`, `session` |
+| `kb_delete` | Remove one document from the index (the file stays on disk); `restore: true` re-indexes it | `path`, `restore`, `workspace`, `session` (the settings page removes the path from every layer it appears in) |
 | `kb_stats` | Index statistics and health | `workspace`, `session` |
 | `kb_sync` | Incremental sync | `max_files`, `prune` |
 | `kb_clear` | Clear indexes | `scope`: `session` / `workspace` / `all` |

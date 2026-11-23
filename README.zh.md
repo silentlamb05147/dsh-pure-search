@@ -102,7 +102,7 @@
 | `kb_ask` | 返回原文证据与出处 | 同 `kb_search`，另含 `max_chars` |
 | `kb_outline` | 列出文档与标题结构 | `query`（按路径或标题过滤）、`workspace`、`session`、`limit` |
 | `kb_get` | 按路径或块 ID 读取原文；`path + chapter` 读取整章 | `path`、`chunk_id`、`chapter`、`start_line`、`end_line`、`max_chars` |
-| `kb_delete` | 从索引移除一篇文档（不删原文件）；`restore: true` 恢复 | `path`、`restore`、`workspace`、`session` |
+| `kb_delete` | 从索引移除一篇文档（不删原文件）；`restore: true` 恢复 | `path`、`restore`、`workspace`、`session`（设置页会一次删除该文件所在的所有层） |
 | `kb_stats` | 索引统计与健康检查 | `workspace`、`session` |
 | `kb_sync` | 增量同步 | `max_files`、`prune` |
 | `kb_clear` | 清理索引 | `scope`：`session` / `workspace` / `all` |

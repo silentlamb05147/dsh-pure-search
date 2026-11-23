@@ -100,8 +100,8 @@ Writes are atomic: the engine writes a temporary `<name>.tmp.<pid>` file inside 
 
 The optional settings page uses DSH's own `webServer` under the prefix `/api/pure-search`:
 
-- `GET /api/pure-search/docs` — reads `manifest.json` only (never the chunk store), enumerates `<kb_root>/<workspace>/_shared` and `<kb_root>/<workspace>/sessions/<name>`, and returns `{name, path, layer, workspace, session, kind, chunks}` per document.
-- `POST /api/pure-search/delete` — accepts `{workspace?, session?, path, restore?}`. The handler resolves `kb_root` from the caller's workspace/session, verifies the resolved root stays under `kb_root`, and forwards a single `delete` request to the engine.
+- `GET /api/pure-search/docs` — reads `manifest.json` only (never the chunk store), enumerates `<kb_root>/<workspace>/_shared` and `<kb_root>/<workspace>/sessions/<name>`, and returns one entry per distinct path with `{name, title, path, kind, chunks, layers:[{layer, workspace, session, chunks}]}`.
+- `POST /api/pure-search/delete` — accepts `{path, restore?}`. The handler enumerates every index root under `kb_root`, skips roots where the path is not indexed, and sends one `delete` request per root; it never deletes source files. All roots come from the fixed `<kb_root>/<workspace>/...` layout, so no caller-supplied root path is trusted.
 
 Both routes are registered on the host's HTTP server, so they inherit its auth and origin policy; the plugin adds no authentication of its own. The page performs no network calls other than these two same-origin requests. If the page is unused, the routes are still registered but do nothing until called.
 

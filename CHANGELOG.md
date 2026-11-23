@@ -11,6 +11,11 @@
 - **`/api/pure-search`**：`GET /docs` 汇总所有工作区与会话层的索引清单，`POST /delete` 按 `workspace` / `session` / `path` 定位到当前层执行删除。
 - **`kb_outline` 新增 `include_excluded`**：可查看墓碑条目（用于找到待恢复的路径）。
 
+### 修复
+
+- **设置页按路径合并**：同一文件同时出现在工作区层与会话层时，只显示一行（徽标写“工作区 + 会话”），删除会移除它所在的所有层。
+- **会话层不再自动收录兄弟文件**：`watch` 只刷新会话层已入库的文档，不再把工作目录里同级的其他文件复制进每个会话索引（此前会导致重复条目和索引膨胀）。
+
 ### 变更
 
 - 插件从 host-only 变为「host + 一个设置页」：`package.json` 增加 `dsh.client`，新增 `client.js`，`exports` 增加 `./client`。
