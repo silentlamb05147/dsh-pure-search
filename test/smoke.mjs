@@ -70,7 +70,7 @@ async function call(name, args) {
 }
 
 try {
-  check('tools registered', tools.size === 8, [...tools.keys()])
+  check('tools registered', tools.size === 9, [...tools.keys()])
 
   const ingest = await call('kb_ingest', { paths: [docs] })
   check('ingest added 3', ingest.ok === true && ingest.added === 3, ingest)

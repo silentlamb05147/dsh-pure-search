@@ -1448,6 +1448,7 @@ class KBEngine:
                 "outline": self.op_outline,
                 "get": self.op_get,
                 "watch": self.op_watch,
+                "delete": self.op_delete,
                 "clear": self.op_clear,
             }.get(op)
             if handler is None:
@@ -2044,6 +2045,14 @@ class KBEngine:
                 digest = _sha256_file(path)
                 doc_id = _doc_id_for(path)
                 previous = docs_meta.get(doc_id)
+                # Tombstone: a document removed from the index keeps its manifest
+                # entry with status="excluded" so the watcher does not re-add it.
+                # An explicit ingest is the user's signal to restore it.
+                if previous is not None and previous.get("status") == "excluded":
+                    if not _get_bool(params, "restore_excluded", True):
+                        skipped += 1
+                        continue
+                    previous = None
                 mtime = float(stat.st_mtime)
                 if (previous is not None and not force and not rechunk
                         and previous.get("sha256") == digest
@@ -2676,6 +2685,7 @@ class KBEngine:
         raw_query = params.get("query")
         query = raw_query.strip().casefold() if isinstance(raw_query, str) else ""
         limit = _clamp_int(params.get("limit"), 200, 1, 2000)
+        include_excluded = _get_bool(params, "include_excluded", False)
         headings: Dict[str, List[str]] = {}
         for chunk in self._load_chunks(root):
             doc_id = chunk.get("doc_id")
@@ -2691,6 +2701,8 @@ class KBEngine:
                 continue
             doc_path = str(entry.get("path") or "")
             title = str(entry.get("title") or "")
+            if entry.get("status") == "excluded" and not include_excluded:
+                continue
             if query and query not in doc_path.casefold() and query not in title.casefold():
                 continue
             items.append({
@@ -3004,6 +3016,11 @@ class KBEngine:
                 if not doc_path:
                     continue
                 known.add(os.path.normcase(os.path.abspath(doc_path)))
+                # Excluded (tombstoned) documents stay known: their paths are in
+                # the manifest on purpose, so the "new files" scan below must not
+                # treat them as new and re-ingest them.
+                if entry.get("status") == "excluded":
+                    continue
                 if not os.path.isfile(doc_path):
                     if entry.get("status") != "missing":
                         entry["status"] = "missing"
@@ -3022,7 +3039,8 @@ class KBEngine:
             if changed:
                 try:
                     result = self.op_ingest({"kb_root": root, "paths": changed,
-                                             "force": True})
+                                             "force": True,
+                                             "restore_excluded": False})
                     refreshed.append({
                         "root": _display_path(root),
                         "paths": [_display_path(path) for path in changed[:20]],
@@ -3049,7 +3067,8 @@ class KBEngine:
             if new_paths:
                 try:
                     result = self.op_ingest({"kb_root": root, "paths": new_paths,
-                                             "recursive": False})
+                                             "recursive": False,
+                                             "restore_excluded": False})
                     added.append({"root": _display_path(root),
                                   "added": result.get("added", 0)})
                 except Exception as exc:
@@ -3060,6 +3079,88 @@ class KBEngine:
             "added": added,
             "missing": [_display_path(path) for path in missing[:20]],
             "elapsed_ms": int((time.time() - started) * 1000),
+        }
+
+    def op_delete(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove one document from the index (never from disk).
+
+        The manifest entry is kept with ``status="excluded"`` (a tombstone) and
+        its chunks are dropped. Keeping the entry is what stops ``op_watch``
+        from treating the still-present file as new and re-ingesting it 30
+        seconds later. ``restore: true`` clears the tombstone and re-indexes.
+        """
+        root = _kb_root(params)
+        raw_path = params.get("path")
+        if not isinstance(raw_path, str) or raw_path.strip() == "":
+            raise KBError("bad_request", "delete requires a non-empty string path")
+        path = os.path.abspath(os.path.expanduser(raw_path.strip()))
+        manifest = self._load_manifest(root)
+        docs = manifest.get("docs") or {}
+        doc_id = _doc_id_for(path)
+        entry = docs.get(doc_id)
+        if entry is None:
+            wanted = os.path.normcase(path)
+            for key, candidate in docs.items():
+                if not isinstance(candidate, dict):
+                    continue
+                known = str(candidate.get("path") or "")
+                if known and os.path.normcase(os.path.abspath(known)) == wanted:
+                    doc_id, entry = key, candidate
+                    break
+        if not isinstance(entry, dict):
+            raise KBError("not_found",
+                          "document is not indexed: %s" % _display_path(path))
+        title = str(entry.get("title") or "")
+
+        if params.get("restore") is True:
+            entry.pop("excluded_at", None)
+            entry["status"] = ""
+            self._save_manifest(root, manifest)
+            restored = self.op_ingest({
+                "kb_root": root,
+                "paths": [path],
+                "force": True,
+                "restore_excluded": True,
+            })
+            return {
+                "restored": True,
+                "doc_id": doc_id,
+                "path": _display_path(path),
+                "title": title,
+                "ingest": restored,
+            }
+
+        if entry.get("status") == "excluded":
+            return {
+                "excluded": True,
+                "already": True,
+                "doc_id": doc_id,
+                "path": _display_path(path),
+                "title": title,
+                "chunks_removed": 0,
+            }
+
+        chunks = self._load_chunks(root)
+        kept = [chunk for chunk in chunks if chunk.get("doc_id") != doc_id]
+        removed = len(chunks) - len(kept)
+        if removed:
+            self._save_chunks(root, kept)
+        entry["status"] = "excluded"
+        entry["excluded_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        entry["chunks"] = 0
+        self._save_manifest(root, manifest)
+        self._chunk_cache.pop(root, None)
+        self._index_cache.pop(root, None)
+        self._token_cache.clear()
+        self._section_cache.clear()
+        log_event(root, "info", "delete excluded", doc_id=doc_id,
+                  path=_display_path(path), chunks_removed=removed)
+        return {
+            "excluded": True,
+            "doc_id": doc_id,
+            "path": _display_path(path),
+            "title": title,
+            "chunks_removed": removed,
         }
 
     def op_clear(self, params: Dict[str, Any]) -> Dict[str, Any]:

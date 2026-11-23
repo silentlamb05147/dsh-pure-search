@@ -1,14 +1,14 @@
 # Security model
 
-This describes version 0.4.3 of `dsh-kb-lite`: one host-only DSH plugin, five tools, one short-lived Python probe, one long-lived Python process. Every claim below is written so that you can check it against the files in this repository, and the commands to do that are at the end.
+This describes version 1.1.0 of `dsh-pure-search`: one DSH plugin with nine host tools, one optional settings page, one short-lived Python probe, one long-lived Python process. Every claim below is written so that you can check it against the files in this repository, and the commands to do that are at the end.
 
 Nothing here is a request for trust. If a line in this document and a line in the code disagree, the code is what runs.
 
 ## Execution model
 
-`dsh-kb-lite` is loaded by DSH as a host plugin. It has no browser UI, no client bundle, and no `dsh.client` field in `package.json` — so it contributes nothing to the DSH web or desktop client and cannot interfere with it. There is no HTTP server, no listening socket, no timer, and no watcher.
+`dsh-pure-search` is loaded by DSH as a plugin. It registers host tools, one 30-second index watcher, and one optional settings page. The page talks to the host through a single prefix route, `/api/pure-search`, registered on DSH's own `webServer`; the plugin opens no listening socket of its own and makes no outbound requests. If you remove `client.js` (and the `dsh.client` field), the plugin falls back to host-only and the route is not registered.
 
-When the plugin is applied it registers five tools and starts nothing. On the first tool call it resolves an interpreter, checks it with a short probe process, and starts one engine process. That engine lives for the life of the plugin instance. Two DSH instances that both load the plugin have two engines, one each; there is no daemon and no shared service.
+When the plugin is applied it registers nine tools, one timer and (optionally) the route, and starts nothing else. On the first tool call it resolves an interpreter, checks it with a short probe process, and starts one engine process. That engine lives for the life of the plugin instance. Two DSH instances that both load the plugin have two engines, one each; there is no daemon and no shared service.
 
 ## The engine process
 
@@ -72,7 +72,7 @@ const result = spawnSync(
 
 ## What it reads
 
-- **The files you pass to `kb_ingest`.** Paths must be absolute. A file is read only if its extension is `.md`, `.markdown`, `.txt` or `.pdf`. A directory is walked to find those extensions; hidden directories and `.git`, `.hg`, `.svn`, `node_modules`, `__pycache__`, `.venv`, `venv`, `.tox`, `.idea`, `.vscode` and similar are skipped, and the contents of unsupported files are not read.
+- **The files you pass to `kb_ingest`.** Paths must be absolute. A file is read only if its extension is `.md`, `.markdown`, `.txt`, `.pdf`, `.docx`, `.html`, `.htm` or `.json`. A directory is walked to find those extensions; hidden directories and `.git`, `.hg`, `.svn`, `node_modules`, `__pycache__`, `.venv`, `venv`, `.tox`, `.idea`, `.vscode` and similar are skipped, and the contents of unsupported files are not read.
 - **Its own `kb_root`.** `manifest.json`, `chunks.jsonl`, and `vectors.npy` / `vectors.json` / `vectors.meta.json` if present, plus `engine.log`.
 - **Its own package files.** `engine/kb_engine.py` is what Python loads.
 
@@ -94,6 +94,17 @@ Writes are atomic: the engine writes a temporary `<name>.tmp.<pid>` file inside 
 
 `kb_root` is created if it does not exist. `kb_clear` deletes the index files there (`manifest.json`, `chunks.jsonl`, the vector files including `vectors.meta.json`); your source documents are never touched, and `engine.log` is left in place. The plugin writes nothing outside `kb_root`.
 
+`kb_delete` does not touch source files either: it removes one document's chunks and marks its manifest entry `status: excluded` (a tombstone, so the 30-second watcher will not re-ingest it). `restore: true` clears the tombstone and re-ingests the file.
+
+## The settings route
+
+The optional settings page uses DSH's own `webServer` under the prefix `/api/pure-search`:
+
+- `GET /api/pure-search/docs` — reads `manifest.json` only (never the chunk store), enumerates `<kb_root>/<workspace>/_shared` and `<kb_root>/<workspace>/sessions/<name>`, and returns `{name, path, layer, workspace, session, kind, chunks}` per document.
+- `POST /api/pure-search/delete` — accepts `{workspace?, session?, path, restore?}`. The handler resolves `kb_root` from the caller's workspace/session, verifies the resolved root stays under `kb_root`, and forwards a single `delete` request to the engine.
+
+Both routes are registered on the host's HTTP server, so they inherit its auth and origin policy; the plugin adds no authentication of its own. The page performs no network calls other than these two same-origin requests. If the page is unused, the routes are still registered but do nothing until called.
+
 Two consequences worth stating plainly:
 
 - **The index contains your documents' text in plain text, unencrypted.** `chunks.jsonl` is a readable copy of everything you ingested. Protect `kb_root` the way you protect the sources. It inherits your filesystem permissions and gets no additional protection.
@@ -103,11 +114,11 @@ Two consequences worth stating plainly:
 
 **Nothing.** There is no installer download, no model fetch in this repository's code, no update check, no telemetry endpoint, no remote index.
 
-One honest qualification: if you install the optional dense stack, `sentence-transformers` — a third-party library you installed yourself — downloads `BAAI/bge-small-zh-v1.5` from Hugging Face the first time it loads the model, unless the model is already in your local cache. That connection is made by that library, not by `dsh-kb-lite`, and it does not happen on a BM25-only install. On a machine that must not egress, pre-populate the Hugging Face cache or skip `sentence-transformers`.
+One honest qualification: if you install the optional dense stack, `sentence-transformers` — a third-party library you installed yourself — downloads `BAAI/bge-small-zh-v1.5` from Hugging Face the first time it loads the model, unless the model is already in your local cache. That connection is made by that library, not by `dsh-pure-search`, and it does not happen on a BM25-only install. On a machine that must not egress, pre-populate the Hugging Face cache or skip `sentence-transformers`.
 
 ## Network
 
-The engine opens no sockets. It imports no `socket`, `http`, `urllib`, `requests` or equivalent, and it neither listens on a port nor connects to one. Its file descriptors are stdin, stdout, stderr, the index files under `kb_root`, and the document paths you named.
+The engine opens no sockets. It imports no `socket`, `http`, `urllib`, `requests` or equivalent, and it neither listens on a port nor connects to one. Its file descriptors are stdin, stdout, stderr, the index files under `kb_root`, and the document paths you named. The host half registers the two settings routes on DSH's existing HTTP server; the plugin itself listens on nothing.
 
 ## Credentials
 

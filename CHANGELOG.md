@@ -2,6 +2,20 @@
 
 本项目从 `1.0.0` 起独立版本号，不再跟随上游的 `0.4.x-local.N`。
 
+## 1.1.0 — 2026-11-23
+
+### 新增
+
+- **`kb_delete`**：从索引移除一篇文档，原文件不动；写入 `status: excluded` 墓碑，后台 `watch` 扫描不会把它重新收录；`restore: true` 或再次 `kb_ingest` 该路径可恢复。
+- **设置页「纯索引」**：列出所有已索引文件的文件名与层级（工作区 / 会话），每行可一键从索引移除；只读 manifest，不经检索，空索引也可打开。
+- **`/api/pure-search`**：`GET /docs` 汇总所有工作区与会话层的索引清单，`POST /delete` 按 `workspace` / `session` / `path` 定位到当前层执行删除。
+- **`kb_outline` 新增 `include_excluded`**：可查看墓碑条目（用于找到待恢复的路径）。
+
+### 变更
+
+- 插件从 host-only 变为「host + 一个设置页」：`package.json` 增加 `dsh.client`，新增 `client.js`，`exports` 增加 `./client`。
+- `test/run-all.mjs` 增加 `test/delete.mjs`（12 项断言：删除、墓碑、watch 不复活、恢复、错误路径）。
+
 ## 1.0.0 — 2026-11-17
 
 首个公开发布版本，源于 [imaused/dsh-kb-lite](https://github.com/imaused/dsh-kb-lite) 0.4.11（已合并上游 0.4.12）。

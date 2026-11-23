@@ -1,5 +1,6 @@
 # dsh-pure-search bundle patch: insert the Host plugin row into the profile.
-# Host-only plugin: no client entry, no front-end injection.
+# Host plugin + one settings page (client.js). The page is read/delete-only and
+# talks to /api/pure-search, so the tools stay usable when the browser side is off.
 - insert:
     - id: pure-search
       name: dsh-pure-search

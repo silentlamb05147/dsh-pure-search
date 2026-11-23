@@ -25,7 +25,7 @@ Rebuilt from [imaused/dsh-kb-lite](https://github.com/imaused/dsh-kb-lite) (MIT)
 | The right document, the wrong passage | Two-stage reranking: order documents first, then rescore passages inside each document without the identifying tokens | Answer-bearing passages in results: 24% → 95% on 100 synthetic questions |
 | Long novels or histories have no structure | Detect chapter lines (`第N章/卷/节/回`, `卷N`, `…纪/传/志`), attach chunks to chapters, read a whole chapter | 438 chapters in 1.33M characters; 130 biographies in the 590k-character *Jinshu* |
 | Do not want a plugin that calls out or calls models | Parsing, indexing and retrieval are entirely local | No network, no sockets, no model calls |
-| Worried a DSH upgrade breaks the plugin | Register host-side tools only; no client injection | Not affected by client API changes |
+| Worried a DSH upgrade breaks the plugin | Host tools carry all functionality; the only client code is one optional settings page | Removing `client.js` leaves a fully working host-only plugin |
 
 ### Suitable / not suitable
 
@@ -63,12 +63,12 @@ Rebuilt from [imaused/dsh-kb-lite](https://github.com/imaused/dsh-kb-lite) (MIT)
 1. **Offline by default** — retrieval, parsing and indexing make no network calls; optional dense retrieval is off by default.
 2. **Citations over answers** — return source text and location; never generate answers.
 3. **Minimal dependencies** — BM25, tokenisation and DOCX/HTML/JSON parsing use the standard library; only PDF requires PyMuPDF.
-4. **Non-invasive** — no client entry point, no DSH UI changes.
+4. **Non-invasive** — one optional settings page (list + remove from index); no other DSH UI changes, and the plugin keeps working if the page is disabled.
 5. **Predictable behaviour** — layers, fallback, cache invalidation and index state are explicit fields.
 
 ## How it works
 
-**Plugin layer (Node.js, ESM)** — registers eight host tools and performs argument validation, layer-path resolution and tool description. No client code.
+**Plugin layer (Node.js, ESM)** — registers nine host tools and performs argument validation, layer-path resolution and tool description. Also ships one read/delete-only settings page (`client.js`) that lists indexed files and can remove one from the index through `/api/pure-search`.
 
 **Engine layer (Python ≥ 3.9)** — `engine/kb_engine.py` runs as a separate subprocess and speaks NDJSON over stdin/stdout, one JSON response per request.
 
@@ -102,11 +102,12 @@ Recursive ingestion skips hidden directories, `.git`, `node_modules`, `.venv` an
 | `kb_ask` | Return evidence and sources | As `kb_search`, plus `max_chars` |
 | `kb_outline` | List documents and headings | `query` (path or title filter), `workspace`, `session`, `limit` |
 | `kb_get` | Read source text by path or chunk ID; read a whole chapter with `path + chapter` | `path`, `chunk_id`, `chapter`, `start_line`, `end_line`, `max_chars` |
+| `kb_delete` | Remove one document from the index (the file stays on disk); `restore: true` re-indexes it | `path`, `restore`, `workspace`, `session` |
 | `kb_stats` | Index statistics and health | `workspace`, `session` |
 | `kb_sync` | Incremental sync | `max_files`, `prune` |
 | `kb_clear` | Clear indexes | `scope`: `session` / `workspace` / `all` |
 
-`kb_ask` returns source passages and locations only; no rewriting, summarising or polishing. Every 30 seconds the plugin lazily scans ingested directories: new and changed files are ingested, deleted files are marked `missing`.
+`kb_ask` returns source passages and locations only; no rewriting, summarising or polishing. Every 30 seconds the plugin lazily scans ingested directories: new and changed files are ingested, deleted files are marked `missing`. `kb_delete` uses a tombstone: the manifest entry stays with `status: excluded`, so the watcher cannot silently re-add the file; `kb_ingest` on the same path restores it.
 
 ## Performance and accuracy
 
