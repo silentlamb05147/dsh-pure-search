@@ -211,6 +211,13 @@ try {
   const purgeAll = await call('POST', '/purge', { all: true })
   check('purge all succeeds', () => assert.equal(purgeAll.body.ok, true))
 
+  const noMissing = await call('POST', '/delete-missing', {})
+  check('delete-missing with no missing docs is a no-op', () => {
+    assert.equal(noMissing.body.ok, true)
+    assert.equal(noMissing.body.removed, 0)
+    assert.deepEqual(noMissing.body.results, [])
+  })
+
   const badRoute = await call('GET', '/nope')
   check('unknown route is 404', () => assert.equal(badRoute.status, 404))
 

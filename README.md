@@ -116,6 +116,7 @@ Settings → Pure Index is an index management page with exactly two parts:
 
 - **Indexed files**: every file's name and real path (monospace, fully readable), with "Open folder", "Copy path" and "Delete" per row; "Open folder" reveals and selects the file in the system file manager (Windows `explorer /select`, macOS `open -R`, Linux `xdg-open` on the parent folder) and only accepts paths that are in the index;
 - **Search & filter**: live search by file name or real path, plus a file-type filter (All / MD / PDF / DOCX / HTML / JSON / TXT …, with counts); the two combine;
+- **Missing cleanup**: entries whose source file was moved or deleted are flagged "missing"; a red "Missing N" chip filters to them, and "Clear missing N" in the header moves them into the recycle bin layer by layer;
 - **Recycle bin**: files already removed from the index (name, path, removal time), each with "Restore" or "Delete permanently", plus "Empty recycle bin".
 
 Every action edits the index only (`manifest.json`, `chunks.jsonl`, `trash.jsonl`); **files on disk are always kept**. The page offers no way to move or rename files on disk.

@@ -99,6 +99,8 @@ window.__ModuleLoader__.load({
   background: var(--ps-chip-bg); border-color: var(--ps-chip-border);
   font-weight: 600;
 }
+.ps-chip-danger { color: var(--ps-danger); border-color: var(--ps-danger); }
+.ps-chip-danger.ps-chip-active { background: rgba(229,72,77,.14); }
 .ps-list { max-height: 46vh; overflow-y: auto; }
 .ps-list::-webkit-scrollbar { width: 9px; }
 .ps-list::-webkit-scrollbar-thumb {
@@ -231,6 +233,7 @@ window.__ModuleLoader__.load({
       const [docs, setDocs] = useState([]);
       const [trash, setTrash] = useState([]);
       const [typeFilter, setTypeFilter] = useState('');
+      const [missingOnly, setMissingOnly] = useState(false);
       const [query, setQuery] = useState('');
       const [loading, setLoading] = useState(true);
       const [error, setError] = useState('');
@@ -366,15 +369,42 @@ window.__ModuleLoader__.load({
         if (typeFilter && !typeCounts.some(([key]) => key === typeFilter)) setTypeFilter('');
       }, [typeFilter, typeCounts]);
 
+      const missingCount = useMemo(
+        () => docs.filter((doc) => doc.status === 'missing').length,
+        [docs],
+      );
+
+      useEffect(() => {
+        if (missingOnly && missingCount === 0) setMissingOnly(false);
+      }, [missingOnly, missingCount]);
+
+      const clearMissing = useCallback(async () => {
+        const ok = window.confirm(
+          `把 ${missingCount} 个“原文件已不存在”的索引移入回收站？\n\n源文件已经被移动或删除，这里只清理索引；需要时可在回收站恢复或彻底删除。`,
+        );
+        if (!ok) return;
+        setBusy('*');
+        setError('');
+        try {
+          await postJson('/delete-missing', {});
+          await load();
+        } catch (err) {
+          setError(`清除失败：${err && err.message ? err.message : String(err)}`);
+        } finally {
+          setBusy('');
+        }
+      }, [load, missingCount]);
+
       const visibleDocs = useMemo(() => {
         const needle = query.trim().toLowerCase();
         return docs.filter((doc) => {
+          if (missingOnly && doc.status !== 'missing') return false;
           if (typeFilter && extOf(doc) !== typeFilter) return false;
           if (!needle) return true;
           return String(doc.name || '').toLowerCase().includes(needle)
             || String(doc.path || '').toLowerCase().includes(needle);
         });
-      }, [docs, typeFilter, query]);
+      }, [docs, typeFilter, query, missingOnly]);
 
       const docRows = visibleDocs.map((doc) => h('div', { key: doc.path, className: 'ps-row' },
         h('div', { className: kindClass(doc.kind) }, extOf(doc)),
@@ -433,6 +463,13 @@ window.__ModuleLoader__.load({
           h('h3', { className: 'ps-title' }, '索引文件'),
           h('span', { className: 'ps-pill' }, loading ? '读取中…' : `${docs.length} 个`),
           h('span', { className: 'ps-spacer' }),
+          missingCount > 0 ? h('button', {
+            type: 'button',
+            className: 'ps-btn ps-btn-sm ps-btn-danger',
+            disabled: busy === '*',
+            title: '把所有原文件已不存在的索引移入回收站',
+            onClick: clearMissing,
+          }, busy === '*' ? '清理中…' : `清除缺失 ${missingCount}`) : null,
           h('button', {
             type: 'button',
             className: 'ps-icon-btn',
@@ -462,11 +499,14 @@ window.__ModuleLoader__.load({
                 title: '清空搜索',
                 onClick: () => setQuery(''),
               }, '✕') : null),
-            typeCounts.length > 1 ? h('div', { className: 'ps-chips' },
+            (typeCounts.length > 1 || missingCount > 0) ? h('div', { className: 'ps-chips' },
               h('button', {
                 type: 'button',
-                className: `ps-chip${typeFilter === '' ? ' ps-chip-active' : ''}`,
-                onClick: () => setTypeFilter(''),
+                className: `ps-chip${typeFilter === '' && !missingOnly ? ' ps-chip-active' : ''}`,
+                onClick: () => {
+                  setTypeFilter('');
+                  setMissingOnly(false);
+                },
               }, `全部 ${docs.length}`),
               ...typeCounts.map(([key, count]) => h('button', {
                 key,
@@ -475,6 +515,12 @@ window.__ModuleLoader__.load({
                 onClick: () => setTypeFilter(key),
                 title: `只看 ${key} 类型`,
               }, `${key} ${count}`)),
+              missingCount > 0 ? h('button', {
+                type: 'button',
+                className: `ps-chip ps-chip-danger${missingOnly ? ' ps-chip-active' : ''}`,
+                onClick: () => setMissingOnly((value) => !value),
+                title: '只看原文件已被移动或删除的条目',
+              }, `缺失 ${missingCount}`) : null,
             ) : null),
           docs.length === 0 && !loading
             ? h('div', { className: 'ps-empty' },
