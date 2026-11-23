@@ -101,6 +101,29 @@ window.__ModuleLoader__.load({
 }
 .ps-chip-danger { color: var(--ps-danger); border-color: var(--ps-danger); }
 .ps-chip-danger.ps-chip-active { background: rgba(229,72,77,.14); }
+.ps-check {
+  appearance: none; -webkit-appearance: none;
+  width: 15px; height: 15px; margin: 0; flex: none; position: relative;
+  border: 1px solid var(--ps-chip-border); border-radius: 4px;
+  background: var(--ps-field); cursor: pointer;
+  transition: background .12s ease, border-color .12s ease;
+}
+.ps-check:hover { border-color: var(--ps-accent); }
+.ps-check:checked { background: rgba(127,127,127,.72); border-color: transparent; }
+.ps-check:checked::after {
+  content: ''; position: absolute; left: 4px; top: 1px;
+  width: 4px; height: 8px; border: solid #fff; border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.ps-check:focus-visible { outline: 2px solid var(--ps-ring); outline-offset: 2px; }
+.ps-selbar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 10px; font-size: 11.5px;
+  border: 1px solid var(--ps-border); border-radius: 9px;
+  background: var(--ps-chip-bg); color: var(--ps-fg);
+}
+.ps-sellabel { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; opacity: .9; }
+.ps-selcount { color: var(--ps-accent); font-weight: 600; }
 .ps-list { max-height: 46vh; overflow-y: auto; }
 .ps-list::-webkit-scrollbar { width: 9px; }
 .ps-list::-webkit-scrollbar-thumb {
@@ -234,6 +257,7 @@ window.__ModuleLoader__.load({
       const [trash, setTrash] = useState([]);
       const [typeFilter, setTypeFilter] = useState('');
       const [missingOnly, setMissingOnly] = useState(false);
+      const [selected, setSelected] = useState(() => new Set());
       const [query, setQuery] = useState('');
       const [loading, setLoading] = useState(true);
       const [error, setError] = useState('');
@@ -395,6 +419,44 @@ window.__ModuleLoader__.load({
         }
       }, [load, missingCount]);
 
+      useEffect(() => {
+        setSelected((prev) => {
+          if (prev.size === 0) return prev;
+          const live = new Set(docs.map((doc) => doc.path));
+          const next = new Set([...prev].filter((item) => live.has(item)));
+          return next.size === prev.size ? prev : next;
+        });
+      }, [docs]);
+
+      const toggleDoc = useCallback((target) => {
+        setSelected((prev) => {
+          const next = new Set(prev);
+          if (next.has(target)) next.delete(target);
+          else next.add(target);
+          return next;
+        });
+      }, []);
+
+      const batchTrash = useCallback(async () => {
+        const paths = [...selected];
+        if (paths.length === 0) return;
+        const ok = window.confirm(
+          `把选中的 ${paths.length} 个索引条目移入回收站？\n\n只清理索引，磁盘上的原文件不会被移动或删除。`,
+        );
+        if (!ok) return;
+        setBusy('*');
+        setError('');
+        try {
+          await postJson('/delete-batch', { paths });
+          setSelected(new Set());
+          await load();
+        } catch (err) {
+          setError(`批量删除失败：${err && err.message ? err.message : String(err)}`);
+        } finally {
+          setBusy('');
+        }
+      }, [load, selected]);
+
       const visibleDocs = useMemo(() => {
         const needle = query.trim().toLowerCase();
         return docs.filter((doc) => {
@@ -406,7 +468,29 @@ window.__ModuleLoader__.load({
         });
       }, [docs, typeFilter, query, missingOnly]);
 
+      const allVisibleSelected = visibleDocs.length > 0
+        && visibleDocs.every((doc) => selected.has(doc.path));
+
+      const toggleAll = useCallback(() => {
+        setSelected((prev) => {
+          const next = new Set(prev);
+          if (visibleDocs.every((doc) => next.has(doc.path))) {
+            for (const doc of visibleDocs) next.delete(doc.path);
+          } else {
+            for (const doc of visibleDocs) next.add(doc.path);
+          }
+          return next;
+        });
+      }, [visibleDocs]);
+
       const docRows = visibleDocs.map((doc) => h('div', { key: doc.path, className: 'ps-row' },
+        h('input', {
+          type: 'checkbox',
+          className: 'ps-check',
+          checked: selected.has(doc.path),
+          onChange: () => toggleDoc(doc.path),
+          'aria-label': `选择 ${doc.name}`,
+        }),
         h('div', { className: kindClass(doc.kind) }, extOf(doc)),
         h('div', { className: 'ps-grow' },
           h('div', { className: 'ps-name', title: doc.name },
@@ -522,6 +606,31 @@ window.__ModuleLoader__.load({
                 title: '只看原文件已被移动或删除的条目',
               }, `缺失 ${missingCount}`) : null,
             ) : null),
+          selected.size > 0 ? h('div', { className: 'ps-selbar' },
+            h('label', { className: 'ps-sellabel' },
+              h('input', {
+                type: 'checkbox',
+                className: 'ps-check',
+                checked: allVisibleSelected,
+                onChange: toggleAll,
+                'aria-label': '选择当前列表里的全部文件',
+              }),
+              `全选当前 ${visibleDocs.length} 条`),
+            h('span', { className: 'ps-selcount' }, `已选 ${selected.size}`),
+            h('span', { className: 'ps-spacer' }),
+            h('button', {
+              type: 'button',
+              className: 'ps-btn ps-btn-sm',
+              disabled: busy === '*',
+              onClick: () => setSelected(new Set()),
+            }, '取消选择'),
+            h('button', {
+              type: 'button',
+              className: 'ps-btn ps-btn-sm ps-btn-danger',
+              disabled: busy === '*',
+              title: '把选中的索引条目批量移入回收站',
+              onClick: batchTrash,
+            }, busy === '*' ? '处理中…' : `移入回收站 ${selected.size}`)) : null,
           docs.length === 0 && !loading
             ? h('div', { className: 'ps-empty' },
               h('div', null, '索引还是空的'),

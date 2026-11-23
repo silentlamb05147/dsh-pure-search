@@ -196,6 +196,24 @@ try {
     assert.ok(afterRestore.body.docs.some((item) => fwd(item.path) === fwd(alpha)))
   })
 
+  const batchTrash = await call('POST', '/delete-batch', { paths: [alpha] })
+  check('batch delete moves docs to trash', () => {
+    assert.equal(batchTrash.body.ok, true)
+    assert.equal(batchTrash.body.removed, 1)
+    assert.ok(batchTrash.body.entries >= 1)
+  })
+
+  const batchTrashList = await call('GET', '/trash')
+  check('batch trashed doc shows up in trash', () => {
+    assert.ok(batchTrashList.body.items.some((item) => fwd(item.path) === fwd(alpha)))
+  })
+
+  const restoreBatch = await call('POST', '/restore', { path: alpha })
+  check('restore after batch delete works', () => assert.equal(restoreBatch.body.ok, true))
+
+  const emptyBatch = await call('POST', '/delete-batch', { paths: [] })
+  check('empty batch is rejected', () => assert.equal(emptyBatch.status, 400))
+
   const trashAgain = await call('POST', '/delete', { path: alpha })
   check('trash again works', () => assert.equal(trashAgain.body.ok, true))
 
