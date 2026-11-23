@@ -74,6 +74,7 @@ if (os.environ.get("KB_LITE_ALLOW_DOWNLOAD") or "").strip() not in ("1", "true",
 # --- on-disk layout -------------------------------------------------------
 MANIFEST_NAME = "manifest.json"
 CHUNKS_NAME = "chunks.jsonl"
+TRASH_NAME = "trash.jsonl"
 VECTORS_NPY = "vectors.npy"
 VECTORS_JSON = "vectors.json"
 VECTORS_META = "vectors.meta.json"
@@ -1449,6 +1450,9 @@ class KBEngine:
                 "get": self.op_get,
                 "watch": self.op_watch,
                 "delete": self.op_delete,
+        "restore": self.op_restore,
+        "purge": self.op_purge,
+        "trash": self.op_trash,
                 "clear": self.op_clear,
             }.get(op)
             if handler is None:
@@ -1580,6 +1584,36 @@ class KBEngine:
         _atomic_write(path, payload.encode("utf-8"))
         self._chunk_cache.pop(root, None)
         self._index_cache.pop(root, None)
+
+    def _load_trash(self, root: str) -> List[Dict[str, Any]]:
+        path = _child(root, TRASH_NAME)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        except FileNotFoundError:
+            return []
+        except OSError:
+            return []
+        items: List[Dict[str, Any]] = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(item, dict) and item.get("doc_id"):
+                items.append(item)
+        return items
+
+    def _save_trash(self, root: str, items: Sequence[Dict[str, Any]]) -> None:
+        path = _child(root, TRASH_NAME)
+        lines = [json.dumps(item, ensure_ascii=False) for item in items]
+        payload = "\n".join(lines)
+        if payload:
+            payload += "\n"
+        _atomic_write(path, payload.encode("utf-8"))
 
     def _vector_meta(self, root: str) -> Dict[str, Any]:
         path = _child(root, VECTORS_META)
@@ -2045,10 +2079,11 @@ class KBEngine:
                 digest = _sha256_file(path)
                 doc_id = _doc_id_for(path)
                 previous = docs_meta.get(doc_id)
-                # Tombstone: a document removed from the index keeps its manifest
-                # entry with status="excluded" so the watcher does not re-add it.
-                # An explicit ingest is the user's signal to restore it.
-                if previous is not None and previous.get("status") == "excluded":
+                # Tombstone / recycle bin: a removed document keeps its manifest
+                # entry with status="trashed" (or legacy "excluded") so the
+                # watcher does not re-add it. An explicit ingest is the user's
+                # signal to restore it.
+                if previous is not None and previous.get("status") in ("trashed", "excluded"):
                     if not _get_bool(params, "restore_excluded", True):
                         skipped += 1
                         continue
@@ -2701,7 +2736,7 @@ class KBEngine:
                 continue
             doc_path = str(entry.get("path") or "")
             title = str(entry.get("title") or "")
-            if entry.get("status") == "excluded" and not include_excluded:
+            if entry.get("status") in ("trashed", "excluded") and not include_excluded:
                 continue
             if query and query not in doc_path.casefold() and query not in title.casefold():
                 continue
@@ -3016,10 +3051,10 @@ class KBEngine:
                 if not doc_path:
                     continue
                 known.add(os.path.normcase(os.path.abspath(doc_path)))
-                # Excluded (tombstoned) documents stay known: their paths are in
+                # Trashed / tombstoned documents stay known: their paths are in
                 # the manifest on purpose, so the "new files" scan below must not
                 # treat them as new and re-ingest them.
-                if entry.get("status") == "excluded":
+                if entry.get("status") in ("trashed", "excluded"):
                     continue
                 if not os.path.isfile(doc_path):
                     if entry.get("status") != "missing":
@@ -3086,87 +3121,206 @@ class KBEngine:
             "elapsed_ms": int((time.time() - started) * 1000),
         }
 
-    def op_delete(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Remove one document from the index (never from disk).
+    @staticmethod
+    def _find_doc(manifest: Dict[str, Any], path: str) -> Any:
+        docs = manifest.get("docs") or {}
+        doc_id = _doc_id_for(path)
+        entry = docs.get(doc_id)
+        if isinstance(entry, dict):
+            return doc_id, entry
+        wanted = os.path.normcase(path)
+        for key, candidate in docs.items():
+            if not isinstance(candidate, dict):
+                continue
+            known = str(candidate.get("path") or "")
+            if known and os.path.normcase(os.path.abspath(known)) == wanted:
+                return key, candidate
+        return None, None
 
-        The manifest entry is kept with ``status="excluded"`` (a tombstone) and
-        its chunks are dropped. Keeping the entry is what stops ``op_watch``
-        from treating the still-present file as new and re-ingesting it 30
-        seconds later. ``restore: true`` clears the tombstone and re-indexes.
+    @staticmethod
+    def _now_stamp() -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    def _drop_caches(self, root: str) -> None:
+        self._chunk_cache.pop(root, None)
+        self._index_cache.pop(root, None)
+        self._token_cache.clear()
+        self._section_cache.clear()
+
+    def op_delete(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Move one document to the recycle bin (never delete it from disk).
+
+        Its chunks move from ``chunks.jsonl`` into ``trash.jsonl`` and the
+        manifest entry stays with ``status="trashed"``. Search and outline
+        ignore trashed entries, and ``op_watch`` treats them as known so the
+        still-present file is not re-ingested. ``restore: true`` restores it.
         """
         root = _kb_root(params)
         raw_path = params.get("path")
         if not isinstance(raw_path, str) or raw_path.strip() == "":
             raise KBError("bad_request", "delete requires a non-empty string path")
         path = os.path.abspath(os.path.expanduser(raw_path.strip()))
+        if params.get("restore") is True:
+            return self.op_restore({"kb_root": root, "path": path})
         manifest = self._load_manifest(root)
-        docs = manifest.get("docs") or {}
-        doc_id = _doc_id_for(path)
-        entry = docs.get(doc_id)
-        if entry is None:
-            wanted = os.path.normcase(path)
-            for key, candidate in docs.items():
-                if not isinstance(candidate, dict):
-                    continue
-                known = str(candidate.get("path") or "")
-                if known and os.path.normcase(os.path.abspath(known)) == wanted:
-                    doc_id, entry = key, candidate
-                    break
+        doc_id, entry = self._find_doc(manifest, path)
         if not isinstance(entry, dict):
             raise KBError("not_found",
                           "document is not indexed: %s" % _display_path(path))
         title = str(entry.get("title") or "")
-
-        if params.get("restore") is True:
-            entry.pop("excluded_at", None)
-            entry["status"] = ""
-            self._save_manifest(root, manifest)
-            restored = self.op_ingest({
-                "kb_root": root,
-                "paths": [path],
-                "force": True,
-                "restore_excluded": True,
-            })
+        if entry.get("status") in ("trashed", "excluded"):
+            if entry.get("status") == "excluded":
+                entry["status"] = "trashed"
+                entry["trashed_at"] = entry.get("excluded_at") or self._now_stamp()
+                entry.pop("excluded_at", None)
+                self._save_manifest(root, manifest)
             return {
-                "restored": True,
-                "doc_id": doc_id,
-                "path": _display_path(path),
-                "title": title,
-                "ingest": restored,
-            }
-
-        if entry.get("status") == "excluded":
-            return {
-                "excluded": True,
+                "trashed": True,
                 "already": True,
                 "doc_id": doc_id,
                 "path": _display_path(path),
                 "title": title,
-                "chunks_removed": 0,
+                "chunks_moved": 0,
             }
-
         chunks = self._load_chunks(root)
+        moving = [chunk for chunk in chunks if chunk.get("doc_id") == doc_id]
         kept = [chunk for chunk in chunks if chunk.get("doc_id") != doc_id]
-        removed = len(chunks) - len(kept)
-        if removed:
+        if moving:
             self._save_chunks(root, kept)
-        entry["status"] = "excluded"
-        entry["excluded_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            trash = [item for item in self._load_trash(root)
+                     if item.get("doc_id") != doc_id]
+            trash.append({
+                "doc_id": doc_id,
+                "path": _display_path(path),
+                "title": title,
+                "trashed_at": self._now_stamp(),
+                "chunks": moving,
+            })
+            self._save_trash(root, trash)
+        entry["status"] = "trashed"
+        entry["trashed_at"] = self._now_stamp()
+        entry.pop("excluded_at", None)
         entry["chunks"] = 0
         self._save_manifest(root, manifest)
-        self._chunk_cache.pop(root, None)
-        self._index_cache.pop(root, None)
-        self._token_cache.clear()
-        self._section_cache.clear()
-        log_event(root, "info", "delete excluded", doc_id=doc_id,
-                  path=_display_path(path), chunks_removed=removed)
+        self._drop_caches(root)
+        log_event(root, "info", "delete trashed", doc_id=doc_id,
+                  path=_display_path(path), chunks_moved=len(moving))
         return {
-            "excluded": True,
+            "trashed": True,
             "doc_id": doc_id,
             "path": _display_path(path),
             "title": title,
-            "chunks_removed": removed,
+            "chunks_moved": len(moving),
         }
+
+    def op_restore(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Restore a trashed document by re-ingesting it from disk."""
+        root = _kb_root(params)
+        raw_path = params.get("path")
+        if not isinstance(raw_path, str) or raw_path.strip() == "":
+            raise KBError("bad_request", "restore requires a non-empty string path")
+        path = os.path.abspath(os.path.expanduser(raw_path.strip()))
+        manifest = self._load_manifest(root)
+        doc_id, entry = self._find_doc(manifest, path)
+        if not isinstance(entry, dict):
+            raise KBError("not_found",
+                          "document is not indexed: %s" % _display_path(path))
+        title = str(entry.get("title") or "")
+        if entry.get("status") not in ("trashed", "excluded"):
+            return {
+                "restored": False,
+                "already": True,
+                "doc_id": doc_id,
+                "path": _display_path(path),
+                "title": title,
+            }
+        self._save_trash(root, [item for item in self._load_trash(root)
+                                if item.get("doc_id") != doc_id])
+        entry["status"] = ""
+        entry.pop("trashed_at", None)
+        entry.pop("excluded_at", None)
+        if not os.path.isfile(path):
+            entry["status"] = "missing"
+            self._save_manifest(root, manifest)
+            return {
+                "restored": False,
+                "missing_file": True,
+                "doc_id": doc_id,
+                "path": _display_path(path),
+                "title": title,
+            }
+        self._save_manifest(root, manifest)
+        ingest = self.op_ingest({
+            "kb_root": root,
+            "paths": [path],
+            "force": True,
+            "restore_excluded": True,
+        })
+        return {
+            "restored": True,
+            "doc_id": doc_id,
+            "path": _display_path(path),
+            "title": title,
+            "ingest": ingest,
+        }
+
+    def op_purge(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Permanently remove trashed documents (``path`` or ``all: true``)."""
+        root = _kb_root(params)
+        manifest = self._load_manifest(root)
+        docs = manifest.get("docs") or {}
+        purge_all = params.get("all") is True
+        raw_path = params.get("path")
+        if not purge_all and not (isinstance(raw_path, str) and raw_path.strip()):
+            raise KBError("bad_request", "purge requires path or all:true")
+        path = (""
+                if purge_all
+                else os.path.abspath(os.path.expanduser(raw_path.strip())))
+        doc_id = None
+        if not purge_all:
+            doc_id, entry = self._find_doc(manifest, path)
+            if not isinstance(entry, dict) or entry.get("status") not in ("trashed", "excluded"):
+                raise KBError("not_found",
+                              "no trashed document at %s" % _display_path(path))
+        removed: List[str] = []
+        if purge_all:
+            for key in list(docs.keys()):
+                entry = docs.get(key)
+                if isinstance(entry, dict) and entry.get("status") in ("trashed", "excluded"):
+                    removed.append(_display_path(str(entry.get("path") or "")))
+                    del docs[key]
+            self._save_trash(root, [])
+        else:
+            removed.append(_display_path(path))
+            docs.pop(doc_id, None)
+            self._save_trash(root, [item for item in self._load_trash(root)
+                                    if item.get("doc_id") != doc_id])
+        self._save_manifest(root, manifest)
+        self._drop_caches(root)
+        log_event(root, "info", "purge", purged=len(removed))
+        return {"purged": len(removed), "paths": removed}
+
+    def op_trash(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """List documents currently sitting in the recycle bin."""
+        root = _kb_root(params)
+        manifest = self._load_manifest(root)
+        docs = manifest.get("docs") or {}
+        items: List[Dict[str, Any]] = []
+        for item in self._load_trash(root):
+            doc_id = str(item.get("doc_id") or "")
+            entry = docs.get(doc_id) if isinstance(docs, dict) else None
+            chunks = item.get("chunks") or []
+            items.append({
+                "doc_id": doc_id,
+                "path": str(item.get("path") or ""),
+                "title": str(item.get("title") or ""),
+                "trashed_at": str(item.get("trashed_at") or ""),
+                "chunks": len(chunks) if isinstance(chunks, list) else 0,
+                "exists": os.path.isfile(str(item.get("path") or "")),
+                "status": str(entry.get("status") or "trashed") if isinstance(entry, dict) else "trashed",
+            })
+        items.sort(key=lambda row: row["trashed_at"], reverse=True)
+        return {"items": items, "total": len(items)}
 
     def op_clear(self, params: Dict[str, Any]) -> Dict[str, Any]:
         root = _kb_root(params)
@@ -3175,8 +3329,8 @@ class KBEngine:
                           "clear requires params.confirm === true")
         manifest = self._load_manifest(root)
         removed_docs = len(manifest.get("docs") or {})
-        for name in (MANIFEST_NAME, CHUNKS_NAME, VECTORS_NPY, VECTORS_JSON,
-                     VECTORS_META):
+        for name in (MANIFEST_NAME, CHUNKS_NAME, TRASH_NAME, VECTORS_NPY,
+                     VECTORS_JSON, VECTORS_META):
             path = _child(root, name)
             try:
                 if os.path.isfile(path):

@@ -1,9 +1,10 @@
 /**
  * dsh-pure-search — settings page.
  *
- * One job: show the files that are in the index, and let the user remove one
- * from the index. The file on disk is never touched; the host tombstones the
- * manifest entry so the watcher cannot silently re-add it 30 seconds later.
+ * Two jobs, one page:
+ *   1. list the files that are in the index and let the user move one to the
+ *      recycle bin (search stops finding it; the file on disk is untouched);
+ *   2. show the recycle bin, where a file can be restored or purged for good.
  *
  * Everything else (search, outline, chapter reads) is a tool, not a page.
  *
@@ -24,6 +25,7 @@ window.__ModuleLoader__.load({
       root: { display: 'flex', flexDirection: 'column', gap: '14px', padding: '4px 0 24px' },
       head: { display: 'flex', alignItems: 'baseline', gap: '10px', flexWrap: 'wrap' },
       title: { fontSize: '16px', fontWeight: 600, margin: 0 },
+      subTitle: { fontSize: '14px', fontWeight: 600, margin: '10px 0 0' },
       count: { fontSize: '12px', opacity: 0.65 },
       note: { fontSize: '12px', opacity: 0.7, lineHeight: 1.6, margin: 0 },
       list: { display: 'flex', flexDirection: 'column', borderTop: '1px solid rgba(127,127,127,0.18)' },
@@ -55,8 +57,10 @@ window.__ModuleLoader__.load({
         color: 'inherit',
         cursor: 'pointer',
       },
+      btnDanger: { color: '#e5484d', borderColor: 'rgba(229,72,77,0.45)' },
       error: { fontSize: '12px', color: '#e5484d' },
       empty: { fontSize: '13px', opacity: 0.6, padding: '18px 0' },
+      divider: { height: '1px', background: 'rgba(127,127,127,0.18)', margin: '6px 0 0' },
     };
 
     function layerLabel(doc) {
@@ -72,8 +76,20 @@ window.__ModuleLoader__.load({
       return `工作区 + 会话${sessions.length > 1 ? ` × ${sessions.length}` : ''}`;
     }
 
+    async function postJson(path, payload) {
+      const res = await fetch(`${API}${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const body = await res.json();
+      if (!body || body.ok !== true) throw new Error((body && body.error) || '请求失败');
+      return body;
+    }
+
     function Page() {
       const [docs, setDocs] = useState([]);
+      const [trash, setTrash] = useState([]);
       const [loading, setLoading] = useState(true);
       const [error, setError] = useState('');
       const [busy, setBusy] = useState('');
@@ -82,10 +98,16 @@ window.__ModuleLoader__.load({
         setLoading(true);
         setError('');
         try {
-          const res = await fetch(`${API}/docs`, { headers: { accept: 'application/json' } });
-          const body = await res.json();
-          if (!body || body.ok !== true) throw new Error((body && body.error) || '读取失败');
-          setDocs(Array.isArray(body.docs) ? body.docs : []);
+          const [docsRes, trashRes] = await Promise.all([
+            fetch(`${API}/docs`, { headers: { accept: 'application/json' } }),
+            fetch(`${API}/trash`, { headers: { accept: 'application/json' } }),
+          ]);
+          const docsBody = await docsRes.json();
+          if (!docsBody || docsBody.ok !== true) throw new Error((docsBody && docsBody.error) || '读取失败');
+          setDocs(Array.isArray(docsBody.docs) ? docsBody.docs : []);
+          const trashBody = await trashRes.json();
+          if (!trashBody || trashBody.ok !== true) throw new Error((trashBody && trashBody.error) || '读取失败');
+          setTrash(Array.isArray(trashBody.items) ? trashBody.items : []);
         } catch (err) {
           setError(`读取失败：${err && err.message ? err.message : String(err)}`);
         } finally {
@@ -97,31 +119,69 @@ window.__ModuleLoader__.load({
         load();
       }, [load]);
 
-      const remove = useCallback(
-        async (doc) => {
-          const ok = window.confirm(
-            `从索引中移除「${doc.name}」？\n\n只会删除索引条目，磁盘上的原文件不受影响；它在所有层（工作区 / 会话）中的索引都会被移除。`,
-          );
-          if (!ok) return;
-          setBusy(doc.path);
-          setError('');
-          try {
-            const res = await fetch(`${API}/delete`, {
-              method: 'POST',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ path: doc.path }),
-            });
-            const body = await res.json();
-            if (!body || body.ok !== true) throw new Error((body && body.error) || '删除失败');
-            setDocs((prev) => prev.filter((item) => item.path !== doc.path));
-          } catch (err) {
-            setError(`删除失败：${err && err.message ? err.message : String(err)}`);
-          } finally {
-            setBusy('');
-          }
-        },
-        [],
-      );
+      const moveToTrash = useCallback(async (doc) => {
+        const ok = window.confirm(
+          `把「${doc.name}」移到回收站？\n\n搜索与列表都不再显示它，磁盘上的原文件不受影响；之后可以在回收站恢复或彻底删除。`,
+        );
+        if (!ok) return;
+        setBusy(doc.path);
+        setError('');
+        try {
+          await postJson('/delete', { path: doc.path });
+          setDocs((prev) => prev.filter((item) => item.path !== doc.path));
+          await load();
+        } catch (err) {
+          setError(`移到回收站失败：${err && err.message ? err.message : String(err)}`);
+        } finally {
+          setBusy('');
+        }
+      }, [load]);
+
+      const restore = useCallback(async (item) => {
+        setBusy(item.path);
+        setError('');
+        try {
+          await postJson('/restore', { path: item.path });
+          await load();
+        } catch (err) {
+          setError(`恢复失败：${err && err.message ? err.message : String(err)}`);
+        } finally {
+          setBusy('');
+        }
+      }, [load]);
+
+      const purge = useCallback(async (item) => {
+        const ok = window.confirm(
+          `彻底删除「${item.name || item.path}」？\n\n会清掉回收站里的索引块与条目，之后只能重新入库才能找回；磁盘上的原文件不受影响。`,
+        );
+        if (!ok) return;
+        setBusy(item.path);
+        setError('');
+        try {
+          await postJson('/purge', { path: item.path });
+          await load();
+        } catch (err) {
+          setError(`彻底删除失败：${err && err.message ? err.message : String(err)}`);
+        } finally {
+          setBusy('');
+        }
+      }, [load]);
+
+      const emptyTrash = useCallback(async () => {
+        if (trash.length === 0) return;
+        const ok = window.confirm(`清空回收站？\n\n共 ${trash.length} 个文件，索引块与条目会被删除，磁盘上的原文件不受影响。`);
+        if (!ok) return;
+        setBusy('*');
+        setError('');
+        try {
+          await postJson('/purge', { all: true });
+          await load();
+        } catch (err) {
+          setError(`清空回收站失败：${err && err.message ? err.message : String(err)}`);
+        } finally {
+          setBusy('');
+        }
+      }, [load, trash.length]);
 
       return h(
         'div',
@@ -135,7 +195,7 @@ window.__ModuleLoader__.load({
         h(
           'p',
           { style: styles.note },
-          '这里只列出已经进索引的文件。删除只删索引，不删磁盘上的原文件；删除后后台扫描也不会把它自动加回来。',
+          '这里只列出已经进索引的文件。删除会把它移到回收站：搜索与列表都不再显示，磁盘上的原文件不受影响，后台扫描也不会把它自动加回来。',
         ),
         error ? h('div', { style: styles.error, role: 'alert' }, error) : null,
         docs.length === 0 && !loading
@@ -151,11 +211,7 @@ window.__ModuleLoader__.load({
                     'div',
                     { style: styles.grow },
                     h('div', { style: styles.name, title: doc.path }, doc.name),
-                    h(
-                      'div',
-                      { style: styles.meta, title: doc.path },
-                      `${doc.kind || 'file'} · ${doc.chunks} 块`,
-                    ),
+                    h('div', { style: styles.meta, title: doc.path }, `${doc.kind || 'file'} · ${doc.chunks} 块`),
                   ),
                   h('span', { style: styles.badge }, layerLabel(doc)),
                   h(
@@ -164,9 +220,58 @@ window.__ModuleLoader__.load({
                       type: 'button',
                       style: styles.btn,
                       disabled: busy === doc.path,
-                      onClick: () => remove(doc),
+                      onClick: () => moveToTrash(doc),
                     },
-                    busy === doc.path ? '删除中…' : '删除',
+                    busy === doc.path ? '移除中…' : '移到回收站',
+                  ),
+                ),
+              ),
+            ),
+        h('div', { style: styles.divider }),
+        h(
+          'div',
+          { style: styles.head },
+          h('h4', { style: styles.subTitle }, '回收站'),
+          h('span', { style: styles.count }, loading ? '读取中…' : `${trash.length} 个`),
+          h(
+            'button',
+            {
+              type: 'button',
+              style: { ...styles.btn, ...styles.btnDanger, marginLeft: 'auto' },
+              disabled: trash.length === 0 || busy === '*',
+              onClick: emptyTrash,
+            },
+            busy === '*' ? '清空中…' : '清空回收站',
+          ),
+        ),
+        trash.length === 0 && !loading
+          ? h('div', { style: styles.empty }, '回收站是空的。')
+          : h(
+              'div',
+              { style: styles.list },
+              trash.map((item) =>
+                h(
+                  'div',
+                  { key: `${item.path}:${item.layer || ''}`, style: styles.row },
+                  h(
+                    'div',
+                    { style: styles.grow },
+                    h('div', { style: styles.name, title: item.path }, item.name || item.path),
+                    h(
+                      'div',
+                      { style: styles.meta, title: item.path },
+                      `${item.chunks || 0} 块 · 移到回收站 ${item.trashed_at ? item.trashed_at.replace('T', ' ').replace('Z', '') : ''}${item.exists === false ? ' · 原文件已不存在' : ''}`,
+                    ),
+                  ),
+                  h(
+                    'button',
+                    { type: 'button', style: styles.btn, disabled: busy === item.path, onClick: () => restore(item) },
+                    busy === item.path ? '处理中…' : '恢复',
+                  ),
+                  h(
+                    'button',
+                    { type: 'button', style: { ...styles.btn, ...styles.btnDanger }, disabled: busy === item.path, onClick: () => purge(item) },
+                    '彻底删除',
                   ),
                 ),
               ),

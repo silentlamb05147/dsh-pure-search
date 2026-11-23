@@ -1,5 +1,7 @@
-// Index deletion: kb_delete tombstones a document (chunks gone, entry kept),
-// the watcher does not re-add it, and a later explicit ingest restores it.
+// Recycle bin: kb_delete moves a document to the bin (chunks out of the
+// searchable store, manifest entry kept so the watcher cannot resurrect it),
+// the bin can list / restore / purge it, and purging is the only way to
+// actually drop the index entry.
 // Run: node test/delete.mjs
 import fs from 'node:fs'
 import os from 'node:os'
@@ -12,6 +14,8 @@ import { applyPlugin } from '../lib/plugin.js'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.dirname(here)
 const base = process.env.KB_LITE_TEST_ROOT || path.join(os.tmpdir(), `kb-lite-delete-${process.pid}`)
+const enginePath = path.join(root, 'engine', 'kb_engine.py')
+const python = process.env.KB_LITE_PYTHON || 'python'
 fs.rmSync(base, { recursive: true, force: true })
 
 const docs = path.join(base, '_docs')
@@ -27,6 +31,23 @@ const checks = []
 function check(name, condition, detail) {
   checks.push({ name, ok: Boolean(condition), detail })
   if (!condition) console.error(`FAIL ${name}`, JSON.stringify(detail) ?? '')
+}
+
+function engine(requests) {
+  const input = requests.map((item, index) => JSON.stringify({ id: index + 1, ...item })).join('\n')
+  const ran = spawnSync(python, [enginePath], {
+    input: `${input}\n`,
+    encoding: 'utf8',
+    timeout: 60_000,
+    env: { ...process.env, KB_LITE_LAZY_DENSE: '1' },
+  })
+  const byId = new Map()
+  for (const line of String(ran.stdout || '').split('\n')) {
+    if (line.trim() === '') continue
+    const parsed = JSON.parse(line)
+    byId.set(parsed.id, parsed)
+  }
+  return { status: ran.status, byId, stderr: ran.stderr }
 }
 
 const tools = new Map()
@@ -55,21 +76,21 @@ try {
   const before = await call('kb_search', { query: '退款窗口' })
   check('searchable before delete', (before.hits || []).length > 0, before.hits?.length)
 
-  const deleted = await call('kb_delete', { path: policy })
+  const moved = await call('kb_delete', { path: policy })
   check(
-    'delete tombstones the document',
-    deleted.ok === true && deleted.excluded === true && deleted.chunks_removed > 0,
-    deleted,
+    'delete moves the document to the bin',
+    moved.ok === true && moved.trashed === true && moved.chunks_moved > 0,
+    moved,
   )
 
   const after = await call('kb_outline', {})
-  check('outline hides deleted document', after.total === 0, after.total)
+  check('outline hides a trashed document', after.total === 0, after.total)
 
   const withExcluded = await call('kb_outline', { include_excluded: true })
   const entry = (withExcluded.docs || [])[0]
   check(
-    'outline include_excluded shows status',
-    withExcluded.total === 1 && entry && entry.status === 'excluded',
+    'outline include_excluded shows status trash',
+    withExcluded.total === 1 && entry && entry.status === 'trashed',
     entry && { status: entry.status, path: entry.path },
   )
 
@@ -86,36 +107,57 @@ try {
     missing.error,
   )
 
-  // The watcher must skip tombstoned paths even though the file is still there.
-  const enginePath = path.join(root, 'engine', 'kb_engine.py')
-  const python = process.env.KB_LITE_PYTHON || 'python'
-  const lines = [
-    { id: 1, op: 'watch', params: { kb_root: base } },
-    { id: 2, op: 'outline', params: { kb_root: path.join(base, '_shared') } },
-  ]
-    .map((item) => JSON.stringify(item))
-    .join('\n')
-  const ran = spawnSync(python, [enginePath], {
-    input: `${lines}\n`,
-    encoding: 'utf8',
-    timeout: 60_000,
-    env: { ...process.env, KB_LITE_LAZY_DENSE: '1' },
-  })
-  const responses = String(ran.stdout || '')
-    .split('\n')
-    .filter((line) => line.trim() !== '')
-    .map((line) => JSON.parse(line))
-  const outline = responses.find((item) => item.id === 2)
+  const listed = engine([{ op: 'trash', params: { kb_root: base } }]).byId.get(1)
   check(
-    'watch does not resurrect a deleted file',
-    ran.status === 0 && outline && outline.ok === true && outline.result.total === 0,
-    outline && { ok: outline.ok, total: outline.result && outline.result.total, status: ran.status },
+    'trash lists the document with its chunks',
+    listed && listed.ok === true && listed.result.total === 1 && listed.result.items[0].chunks > 0,
+    listed && listed.result,
   )
 
-  const restored = await call('kb_ingest', { paths: [policy] })
-  check('explicit ingest restores the document', restored.ok === true && restored.added === 1, restored)
-  const back = await call('kb_outline', {})
-  check('outline shows it again', back.total === 1, back.total)
+  // The watcher must skip trashed paths even though the file is still there.
+  const watchRun = engine([
+    { op: 'watch', params: { kb_root: base } },
+    { op: 'outline', params: { kb_root: base } },
+  ])
+  const watched = watchRun.byId.get(2)
+  check(
+    'watch does not resurrect a trashed file',
+    watchRun.status === 0 && watched && watched.ok === true && watched.result.total === 0,
+    watched && watched.result && watched.result.total,
+  )
+
+  const restored = engine([{ op: 'restore', params: { kb_root: base, path: policy } }]).byId.get(1)
+  check('restore brings it back', restored && restored.ok === true && restored.result.restored === true, restored)
+  const back = await call('kb_search', { query: '退款窗口' })
+  check('searchable again after restore', (back.hits || []).length > 0, back.hits?.length)
+
+  const trashedAgain = await call('kb_delete', { path: policy })
+  check('can trash it a second time', trashedAgain.ok === true && trashedAgain.trashed === true, trashedAgain)
+
+  const purged = engine([{ op: 'purge', params: { kb_root: base, path: policy } }]).byId.get(1)
+  check('purge drops the entry for good', purged && purged.ok === true && purged.result.purged === 1, purged)
+
+  const afterPurge = engine([
+    { op: 'outline', params: { kb_root: base, include_excluded: true } },
+    { op: 'trash', params: { kb_root: base } },
+  ])
+  const outlineAfter = afterPurge.byId.get(1)
+  const trashAfter = afterPurge.byId.get(2)
+  check(
+    'purge leaves neither entry nor bin row',
+    outlineAfter.result.total === 0 && trashAfter.result.total === 0,
+    { outline: outlineAfter.result.total, trash: trashAfter.result.total },
+  )
+
+  const purgedMissing = engine([{ op: 'purge', params: { kb_root: base, path: path.join(docs, 'nope.md') } }]).byId.get(1)
+  check(
+    'purge of an unindexed path returns not_found',
+    purgedMissing.ok === false && purgedMissing.error && purgedMissing.error.code === 'not_found',
+    purgedMissing.error,
+  )
+
+  const reingest = await call('kb_ingest', { paths: [policy] })
+  check('explicit ingest indexes it again', reingest.ok === true && reingest.added === 1, reingest)
 } finally {
   fs.rmSync(base, { recursive: true, force: true })
 }

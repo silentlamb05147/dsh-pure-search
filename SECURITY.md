@@ -94,7 +94,7 @@ Writes are atomic: the engine writes a temporary `<name>.tmp.<pid>` file inside 
 
 `kb_root` is created if it does not exist. `kb_clear` deletes the index files there (`manifest.json`, `chunks.jsonl`, the vector files including `vectors.meta.json`); your source documents are never touched, and `engine.log` is left in place. The plugin writes nothing outside `kb_root`.
 
-`kb_delete` does not touch source files either: it removes one document's chunks and marks its manifest entry `status: excluded` (a tombstone, so the 30-second watcher will not re-ingest it). `restore: true` clears the tombstone and re-ingests the file.
+`kb_delete` does not touch source files either: it moves one document's chunks to `trash.jsonl` and marks its manifest entry `status: trashed`, so the 30-second watcher will not re-ingest it. `restore: true` restores it from the bin; only purge (single or `all`) actually drops the entry.
 
 ## The settings route
 

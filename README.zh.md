@@ -102,12 +102,12 @@
 | `kb_ask` | 返回原文证据与出处 | 同 `kb_search`，另含 `max_chars` |
 | `kb_outline` | 列出文档与标题结构 | `query`（按路径或标题过滤）、`workspace`、`session`、`limit` |
 | `kb_get` | 按路径或块 ID 读取原文；`path + chapter` 读取整章 | `path`、`chunk_id`、`chapter`、`start_line`、`end_line`、`max_chars` |
-| `kb_delete` | 从索引移除一篇文档（不删原文件）；`restore: true` 恢复 | `path`、`restore`、`workspace`、`session`（设置页会一次删除该文件所在的所有层） |
+| `kb_delete` | 移到回收站：搜索与列表不再返回，原文件不动；`restore: true` 立即恢复 | `path`、`restore`、`workspace`、`session`（设置页会一次移动该文件所在的所有层） |
 | `kb_stats` | 索引统计与健康检查 | `workspace`、`session` |
 | `kb_sync` | 增量同步 | `max_files`、`prune` |
 | `kb_clear` | 清理索引 | `scope`：`session` / `workspace` / `all` |
 
-`kb_ask` 仅返回原文段落与出处，不进行改写、摘要或润色。插件每 30 秒对已入库目录执行一次惰性扫描：新增与变更文件自动入库，删除文件标记为 `missing`。`kb_delete` 采用墓碑机制：manifest 中保留 `status: excluded` 的条目，因此后台扫描不会把刚删掉的文件重新加回来；再次 `kb_ingest` 该路径即可恢复。
+`kb_ask` 仅返回原文段落与出处，不进行改写、摘要或润色。插件每 30 秒对已入库目录执行一次惰性扫描：新增与变更文件自动入库，删除文件标记为 `missing`。`kb_delete` 把文档移入**回收站**：块从 `chunks.jsonl` 搬到 `trash.jsonl`，manifest 保留 `status: trashed` 条目，因此搜索、列表与后台扫描都不会再碰它；在设置页或 `kb_delete(restore: true)` 中可恢复，只有“彻底删除/清空回收站”才真正移除条目。
 
 ## 性能与准确率
 

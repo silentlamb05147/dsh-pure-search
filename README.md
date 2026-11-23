@@ -102,12 +102,12 @@ Recursive ingestion skips hidden directories, `.git`, `node_modules`, `.venv` an
 | `kb_ask` | Return evidence and sources | As `kb_search`, plus `max_chars` |
 | `kb_outline` | List documents and headings | `query` (path or title filter), `workspace`, `session`, `limit` |
 | `kb_get` | Read source text by path or chunk ID; read a whole chapter with `path + chapter` | `path`, `chunk_id`, `chapter`, `start_line`, `end_line`, `max_chars` |
-| `kb_delete` | Remove one document from the index (the file stays on disk); `restore: true` re-indexes it | `path`, `restore`, `workspace`, `session` (the settings page removes the path from every layer it appears in) |
+| `kb_delete` | Move one document to the recycle bin (search and lists stop returning it, the file stays on disk); `restore: true` restores it immediately | `path`, `restore`, `workspace`, `session` (the settings page moves the path in every layer it appears in) |
 | `kb_stats` | Index statistics and health | `workspace`, `session` |
 | `kb_sync` | Incremental sync | `max_files`, `prune` |
 | `kb_clear` | Clear indexes | `scope`: `session` / `workspace` / `all` |
 
-`kb_ask` returns source passages and locations only; no rewriting, summarising or polishing. Every 30 seconds the plugin lazily scans ingested directories: new and changed files are ingested, deleted files are marked `missing`. `kb_delete` uses a tombstone: the manifest entry stays with `status: excluded`, so the watcher cannot silently re-add the file; `kb_ingest` on the same path restores it.
+`kb_ask` returns source passages and locations only; no rewriting, summarising or polishing. Every 30 seconds the plugin lazily scans ingested directories: new and changed files are ingested, deleted files are marked `missing`. `kb_delete` moves a document to the **recycle bin**: its chunks leave `chunks.jsonl` for `trash.jsonl`, the manifest entry stays with `status: trashed`, so search, listings and the watcher all skip it; restore it from the settings page or with `kb_delete(restore: true)`. Only “delete permanently” / “empty recycle bin” drops the entry.
 
 ## Performance and accuracy
 
