@@ -55,7 +55,7 @@ Rebuilt from [imaused/dsh-kb-lite](https://github.com/imaused/dsh-kb-lite) (MIT)
 | Chapter support | Plain-text chapter detection; `kb_get path + chapter` returns a whole chapter with line ranges |
 | Faithful citations | Returns original text and location; no rewriting, summarising or polishing |
 | Layer isolation | Workspace-shared and session-private layers with explicit fallback markers |
-| Index management | An optional settings page lists indexed files, offers a recycle bin (restore / purge) and virtual folders; it only edits the index, never the disk |
+| Index management | An optional settings page lists each indexed file's name and real path, with a recycle bin (restore / purge); it only edits the index, never the disk |
 | Host compatibility | Tools run in the host; the only client code is an optional settings page, and removing `client.js` leaves a complete host-only plugin |
 | Maintainable | Upstream git history and tags preserved; four test suites and CI |
 
@@ -64,12 +64,12 @@ Rebuilt from [imaused/dsh-kb-lite](https://github.com/imaused/dsh-kb-lite) (MIT)
 1. **Offline by default** — retrieval, parsing and indexing make no network calls; optional dense retrieval is off by default.
 2. **Citations over answers** — return source text and location; never generate answers.
 3. **Minimal dependencies** — BM25, tokenisation and DOCX/HTML/JSON parsing use the standard library; only PDF requires PyMuPDF.
-4. **Non-invasive** — one optional settings page (list, folders, recycle bin); no other DSH UI changes, and the plugin keeps working if the page is disabled.
+4. **Non-invasive** — one optional settings page (index list + recycle bin); no other DSH UI changes, and the plugin keeps working if the page is disabled.
 5. **Predictable behaviour** — layers, fallback, cache invalidation and index state are explicit fields.
 
 ## How it works
 
-**Plugin layer (Node.js, ESM)** — registers nine host tools and performs argument validation, layer-path resolution and tool description. Also ships one optional settings page (`client.js`: file list, virtual folders, recycle bin) that talks to the host through `/api/pure-search`.
+**Plugin layer (Node.js, ESM)** — registers nine host tools and performs argument validation, layer-path resolution and tool description. Also ships one optional settings page (`client.js`: file names, real paths, recycle bin) that talks to the host through `/api/pure-search`.
 
 **Engine layer (Python ≥ 3.9)** — `engine/kb_engine.py` runs as a separate subprocess and speaks NDJSON over stdin/stdout, one JSON response per request.
 
@@ -110,15 +110,14 @@ Recursive ingestion skips hidden directories, `.git`, `node_modules`, `.venv` an
 
 `kb_ask` returns source passages and locations only; no rewriting, summarising or polishing. Every 30 seconds the plugin lazily scans ingested directories: new and changed files are ingested, deleted files are marked `missing`. `kb_delete` moves a document to the **recycle bin**: its chunks leave `chunks.jsonl` for `trash.jsonl`, the manifest entry stays with `status: trashed`, so search, listings and the watcher all skip it; restore it from the settings page or with `kb_delete(restore: true)`. Only “delete permanently” / “empty recycle bin” drops the entry.
 
-## Virtual folders
+## Settings page
 
-Indexed documents can be grouped into folders, but the folders live only in the index: `<kb_root>/_folders.json` stores the folder tree and each manifest entry carries a `category` field. Files on disk are never moved, renamed or deleted.
+Settings → Pure Index is an index management page with exactly two parts:
 
-- create, rename and delete folders (empty folders only; a non-empty folder returns 409);
-- bulk move: tick several files and pick "Move to…";
-- at most 6 levels; renaming rewrites the `category` prefix of every document underneath;
-- the settings page shows the tree with counts on the left and a filterable list on the right;
-- endpoints: `GET /api/pure-search/folders`, `POST /folder` (create / rename / delete), `POST /move`.
+- **Indexed**: every file's name and real path (monospace, fully readable), with a per-row "Delete" that moves it to the recycle bin;
+- **Recycle bin**: files already removed from the index (name, path, removal time), each with "Restore" or "Delete permanently", plus "Empty recycle bin".
+
+Every action edits the index only (`manifest.json`, `chunks.jsonl`, `trash.jsonl`); **files on disk are always kept**. The page offers no way to move or rename files on disk.
 
 ## Performance and accuracy
 
