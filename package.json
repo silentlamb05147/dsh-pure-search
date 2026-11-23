@@ -1,6 +1,6 @@
 {
   "name": "dsh-pure-search",
-  "version": "1.3.5",
+  "version": "1.3.6",
   "description": "Pure local search for DeepSeek Harness: ingest Markdown, TXT, PDF, DOCX, HTML and JSON into workspace/session layered indexes, then retrieve the exact passage with verifiable citations. BM25 by default, optional dense; offline; no sockets.",
   "type": "module",
   "main": "lib/index.js",

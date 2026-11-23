@@ -119,7 +119,8 @@ window.__ModuleLoader__.load({
 }
 .ps-path {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 11px; opacity: .48; word-break: break-all; line-height: 1.45;
+  font-size: 11px; opacity: .48; line-height: 1.45;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .ps-meta { font-size: 11px; opacity: .45; }
 .ps-ext {
@@ -143,7 +144,7 @@ window.__ModuleLoader__.load({
 }
 .ps-btn:hover { background: var(--ps-hover); border-color: var(--ps-accent); }
 .ps-btn:disabled { opacity: .4; cursor: default; }
-.ps-btn-sm { font-size: 11px; padding: 3px 8px; }
+.ps-btn-sm { font-size: 11px; padding: 3px 8px; min-width: 56px; text-align: center; }
 .ps-btn-danger { color: var(--ps-danger); border-color: rgba(229,72,77,.35); }
 .ps-btn-danger:hover {
   background: rgba(229,72,77,.08); border-color: rgba(229,72,77,.5);
@@ -394,7 +395,7 @@ window.__ModuleLoader__.load({
           disabled: busy === doc.path,
           title: '移出索引，放进回收站',
           onClick: () => trashOne(doc),
-        }, busy === doc.path ? '处理中…' : '删除'),
+        }, '删除'),
       ));
 
       const trashRows = trash.map((item) => h('div', { key: `${item.path}:${item.layer || ''}`, className: 'ps-row' },
@@ -409,7 +410,7 @@ window.__ModuleLoader__.load({
           className: 'ps-btn',
           disabled: busy === item.path,
           onClick: () => restore(item),
-        }, busy === item.path ? '处理中…' : '恢复'),
+        }, '恢复'),
         h('button', {
           type: 'button',
           className: 'ps-btn ps-btn-danger',
