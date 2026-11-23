@@ -114,7 +114,8 @@ Recursive ingestion skips hidden directories, `.git`, `node_modules`, `.venv` an
 
 Settings → Pure Index is an index management page with exactly two parts:
 
-- **Indexed**: every file's name and real path (monospace, fully readable), with a file-type filter above it (All / MD / PDF / DOCX / HTML / JSON / TXT …, with counts), plus a per-row "Delete" that moves it to the recycle bin;
+- **Indexed files**: every file's name and real path (monospace, fully readable), one "Delete" per row that moves it to the recycle bin;
+- **Search & filter**: live search by file name or real path, plus a file-type filter (All / MD / PDF / DOCX / HTML / JSON / TXT …, with counts); the two combine;
 - **Recycle bin**: files already removed from the index (name, path, removal time), each with "Restore" or "Delete permanently", plus "Empty recycle bin".
 
 Every action edits the index only (`manifest.json`, `chunks.jsonl`, `trash.jsonl`); **files on disk are always kept**. The page offers no way to move or rename files on disk.
