@@ -1453,6 +1453,8 @@ class KBEngine:
         "restore": self.op_restore,
         "purge": self.op_purge,
         "trash": self.op_trash,
+        "set_category": self.op_set_category,
+        "rename_category": self.op_rename_category,
                 "clear": self.op_clear,
             }.get(op)
             if handler is None:
@@ -1997,6 +1999,9 @@ class KBEngine:
         with_embeddings = params.get("with_embeddings", "auto")
         chunk_cfg = _chunk_cfg(params)
         max_file_bytes = _max_file_bytes(params)
+        category_param = params.get("category")
+        category_given = isinstance(category_param, str)
+        category_value = category_param.strip() if category_given else ""
 
         manifest = self._load_manifest(root)
         docs_meta: Dict[str, Any] = manifest["docs"]
@@ -2113,6 +2118,9 @@ class KBEngine:
                         "text": chunk.get("text", ""),
                     })
                 by_doc[doc_id] = doc_chunks
+                previous_category = ""
+                if isinstance(previous, dict):
+                    previous_category = str(previous.get("category") or "")
                 docs_meta[doc_id] = {
                     "path": display,
                     "sha256": digest,
@@ -2123,6 +2131,7 @@ class KBEngine:
                     "status": status or None,
                     "pages": parsed["pages"],
                     "chunks": len(doc_chunks),
+                    "category": category_value if category_given else previous_category,
                 }
                 if previous is not None:
                     updated += 1
@@ -2748,6 +2757,7 @@ class KBEngine:
                 "size": entry.get("size"),
                 "chunks": entry.get("chunks"),
                 "status": entry.get("status"),
+                "category": str(entry.get("category") or ""),
                 "headings": headings.get(doc_id, [])[:20],
             })
         items.sort(key=lambda item: (item["path"].casefold(), item["doc_id"]))
@@ -3321,6 +3331,72 @@ class KBEngine:
             })
         items.sort(key=lambda row: row["trashed_at"], reverse=True)
         return {"items": items, "total": len(items)}
+
+    def op_set_category(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Assign a folder (``category``) to one or more indexed documents."""
+        root = _kb_root(params)
+        raw_category = params.get("category", "")
+        if not isinstance(raw_category, str):
+            raise KBError("bad_request", "params.category must be a string")
+        category = raw_category.strip()
+        raw_paths = params.get("paths")
+        if isinstance(raw_paths, str):
+            raw_paths = [raw_paths]
+        if not isinstance(raw_paths, list) or not raw_paths:
+            raise KBError("bad_request", "params.paths must be a non-empty array")
+        manifest = self._load_manifest(root)
+        updated: List[str] = []
+        missing: List[str] = []
+        changed = False
+        for raw in raw_paths:
+            if not isinstance(raw, str) or raw.strip() == "":
+                continue
+            path = os.path.abspath(os.path.expanduser(raw.strip()))
+            doc_id, entry = self._find_doc(manifest, path)
+            if not isinstance(entry, dict):
+                missing.append(_display_path(path))
+                continue
+            if str(entry.get("category") or "") != category:
+                entry["category"] = category
+                changed = True
+            updated.append(_display_path(path))
+        if changed:
+            self._save_manifest(root, manifest)
+            log_event(root, "info", "set category", category=category,
+                      updated=len(updated))
+        return {"ok": True, "category": category, "updated": updated,
+                "missing": missing}
+
+    def op_rename_category(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Rename a folder and every sub-folder under it."""
+        root = _kb_root(params)
+        old = params.get("old")
+        new = params.get("new")
+        if not isinstance(old, str) or old.strip() == "":
+            raise KBError("bad_request", "params.old must be a non-empty string")
+        if not isinstance(new, str) or new.strip() == "":
+            raise KBError("bad_request", "params.new must be a non-empty string")
+        old = old.strip().strip("/")
+        new = new.strip().strip("/")
+        manifest = self._load_manifest(root)
+        docs = manifest.get("docs") or {}
+        prefix = old + "/"
+        touched = 0
+        for entry in docs.values():
+            if not isinstance(entry, dict):
+                continue
+            current = str(entry.get("category") or "")
+            if current == old:
+                entry["category"] = new
+                touched += 1
+            elif current.startswith(prefix):
+                entry["category"] = new + "/" + current[len(prefix):]
+                touched += 1
+        if touched:
+            self._save_manifest(root, manifest)
+            log_event(root, "info", "rename category", old=old, new=new,
+                      touched=touched)
+        return {"ok": True, "old": old, "new": new, "touched": touched}
 
     def op_clear(self, params: Dict[str, Any]) -> Dict[str, Any]:
         root = _kb_root(params)

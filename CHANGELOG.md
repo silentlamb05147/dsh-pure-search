@@ -2,6 +2,19 @@
 
 本项目从 `1.0.0` 起独立版本号，不再跟随上游的 `0.4.x-local.N`。
 
+## 1.3.0 — 2026-11-23
+
+### 新增
+
+- **虚拟文件夹**：索引条目可以放进文件夹，文件夹只存在于索引里（`<kb_root>/_folders.json`），manifest 每个文档多一个 `category` 字段；磁盘文件不移动、不重命名、不删除。支持新建 / 重命名 / 删除（仅空文件夹，非空返回 409）、批量移动、最多 6 层。
+- **设置页两栏布局**：左侧文件夹树（含计数、“全部/未分类”），右侧文件列表（按名称或路径过滤、勾选、全选、批量移动、批量移入回收站）。
+- **接口**：`GET /api/pure-search/folders`、`POST /api/pure-search/folder`（create / rename / delete）、`POST /api/pure-search/move`；引擎侧新增 `set_category` / `rename_category`，`op_ingest` 与 `op_outline` 透传 `category`。
+- **测试**：新增 `test/http.mjs`（24 项，覆盖 docs / folders / folder / move / delete / trash / restore / purge / 404 / 原文件不动），`test/run-all.mjs` 接入。
+
+### 修复
+
+- 文件夹名校验按“路径”处理：允许用 `/` 表示嵌套，但每一层仍拒绝 `..`、空层、超长（单层 60 字）与超过 6 层；此前 `小说/两界` 会被误判为非法名字。
+
 ## 1.2.0 — 2026-11-23
 
 ### 新增
