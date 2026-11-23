@@ -143,6 +143,7 @@ window.__ModuleLoader__.load({
 }
 .ps-btn:hover { background: var(--ps-hover); border-color: var(--ps-accent); }
 .ps-btn:disabled { opacity: .4; cursor: default; }
+.ps-btn-sm { font-size: 11px; padding: 3px 8px; }
 .ps-btn-danger { color: var(--ps-danger); border-color: rgba(229,72,77,.35); }
 .ps-btn-danger:hover {
   background: rgba(229,72,77,.08); border-color: rgba(229,72,77,.5);
@@ -228,6 +229,7 @@ window.__ModuleLoader__.load({
       const [loading, setLoading] = useState(true);
       const [error, setError] = useState('');
       const [busy, setBusy] = useState('');
+      const [copied, setCopied] = useState('');
 
       const load = useCallback(async () => {
         setLoading(true);
@@ -246,6 +248,39 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         load();
       }, [load]);
+
+      const openFolder = useCallback(async (doc) => {
+        setBusy(doc.path);
+        setError('');
+        try {
+          const res = await fetch(`${API}/reveal`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ path: doc.path }),
+          });
+          const body = await res.json();
+          if (!body || body.ok !== true) {
+            const code = body && body.error;
+            if (code === 'file_missing') throw new Error('原文件已不存在（可能已被移动或删除）');
+            if (code === 'unknown_path') throw new Error('该路径不在索引中');
+            throw new Error(code || '打开失败');
+          }
+        } catch (err) {
+          setError(`打开文件夹失败：${err && err.message ? err.message : String(err)}`);
+        } finally {
+          setBusy('');
+        }
+      }, []);
+
+      const copyPath = useCallback(async (doc) => {
+        try {
+          await navigator.clipboard.writeText(String(doc.path || ''));
+          setCopied(doc.path);
+          window.setTimeout(() => setCopied(''), 1600);
+        } catch {
+          setError('复制失败：浏览器不允许写剪贴板，请手动选中路径复制');
+        }
+      }, []);
 
       const trashOne = useCallback(async (doc) => {
         const ok = window.confirm(
@@ -342,7 +377,20 @@ window.__ModuleLoader__.load({
           h('div', { className: 'ps-path', title: doc.path }, doc.path)),
         h('button', {
           type: 'button',
-          className: 'ps-btn ps-btn-danger',
+          className: 'ps-btn ps-btn-sm',
+          disabled: busy === doc.path || doc.status === 'missing',
+          title: doc.status === 'missing' ? '原文件已不存在' : '在系统文件管理器中显示该文件',
+          onClick: () => openFolder(doc),
+        }, '打开'),
+        h('button', {
+          type: 'button',
+          className: 'ps-btn ps-btn-sm',
+          title: copied === doc.path ? '已复制' : '复制真实路径',
+          onClick: () => copyPath(doc),
+        }, copied === doc.path ? '已复制' : '复制'),
+        h('button', {
+          type: 'button',
+          className: 'ps-btn ps-btn-sm ps-btn-danger',
           disabled: busy === doc.path,
           title: '移出索引，放进回收站',
           onClick: () => trashOne(doc),
