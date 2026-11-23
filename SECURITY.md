@@ -124,7 +124,7 @@ The engine opens no sockets. It imports no `socket`, `http`, `urllib`, `requests
 
 None. There is no API key, token, cookie, account or login. No environment variable carrying a secret is read. The plugin stores nothing that could authenticate anywhere, because it never authenticates anywhere.
 
-It does inherit your environment (`...process.env`), as any child process does. That is an inheritance, not a use: kb-lite does not read credential variables.
+It does inherit your environment (`...process.env`), as any child process does. That is an inheritance, not a use: this plugin does not read credential variables.
 
 ## Install-time behaviour
 
@@ -231,7 +231,7 @@ ss -tp | grep <pid>
 
 Expect no rows while queries and ingests are running. Do this with the dense model already cached: during the one-time model download the connection belongs to `sentence-transformers`, as described above.
 
-**9. Confirm the write boundary.** `kb_stats` returns the `kb_root` in use; list it:
+**9. Confirm the write boundary.** `kb_stats` returns the `kb_root` in use; list it (the default directory keeps the `~/.kb-lite` name for backward compatibility with the 1.x index format):
 
 ```powershell
 Get-ChildItem -Force (Join-Path $env:USERPROFILE '.kb-lite')
