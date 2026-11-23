@@ -47,6 +47,12 @@ window.__ModuleLoader__.load({
 }
 .ps-spacer { flex: 1; }
 .ps-hint { font-size: 12px; opacity: .55; line-height: 1.7; margin: -8px 0 0; }
+.ps-help {
+  font-size: 12px; line-height: 1.75; opacity: .85;
+  margin: -6px 0 0; padding: 10px 12px;
+  border: 1px solid var(--ps-border); border-radius: 9px;
+  background: var(--ps-surface);
+}
 .ps-error {
   font-size: 12px; color: var(--ps-danger); padding: 8px 12px;
   border: 1px solid rgba(229,72,77,.35); border-radius: 10px;
@@ -258,6 +264,7 @@ window.__ModuleLoader__.load({
       const [typeFilter, setTypeFilter] = useState('');
       const [missingOnly, setMissingOnly] = useState(false);
       const [selected, setSelected] = useState(() => new Set());
+      const [showHelp, setShowHelp] = useState(false);
       const [query, setQuery] = useState('');
       const [loading, setLoading] = useState(true);
       const [error, setError] = useState('');
@@ -544,7 +551,14 @@ window.__ModuleLoader__.load({
 
       return h('div', { className: 'ps-root' },
         h('div', { className: 'ps-head' },
-          h('h3', { className: 'ps-title' }, '索引文件'),
+          h('h3', { className: 'ps-title' }, '知识库管理'),
+          h('button', {
+            type: 'button',
+            className: 'ps-icon-btn',
+            title: showHelp ? '收起说明' : '查看说明',
+            'aria-expanded': showHelp ? 'true' : 'false',
+            onClick: () => setShowHelp((value) => !value),
+          }, showHelp ? '✕' : 'ⓘ'),
           h('span', { className: 'ps-pill' }, loading ? '读取中…' : `${docs.length} 个`),
           h('span', { className: 'ps-spacer' }),
           missingCount > 0 ? h('button', {
@@ -561,8 +575,8 @@ window.__ModuleLoader__.load({
             disabled: loading,
             onClick: load,
           }, '↻')),
-        h('p', { className: 'ps-hint' },
-          '这里管理的是索引本身：文件来自入库存档，删除只会把它移进回收站；磁盘上的原文件始终保留。'),
+        showHelp ? h('div', { className: 'ps-help' },
+          '本页管理本地文档索引：列出已入库文件，可按名称、类型、缺失状态筛选与批量删除；删除只移入回收站，不碰磁盘原文件；索引与检索均在本机完成，适合集中管理项目文档、资料与笔记。') : null,
         error ? h('div', { className: 'ps-error', role: 'alert' }, error) : null,
 
         h('div', { className: 'ps-card' },
@@ -665,7 +679,7 @@ window.__ModuleLoader__.load({
     function apply(ctx) {
       ctx.slots.inject('settings.section', () =>
         ctx.slots.register(
-          { name: 'settings.section', id: 'pure-search', order: 44, label: () => '纯索引' },
+          { name: 'settings.section', id: 'pure-search', order: 44, label: () => '知识库管理' },
           () => h(Page),
         ),
       );

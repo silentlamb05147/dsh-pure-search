@@ -112,7 +112,7 @@ Recursive ingestion skips hidden directories, `.git`, `node_modules`, `.venv` an
 
 ## Settings page
 
-Settings → Pure Index is an index management page with exactly two parts:
+Settings → Knowledge Base is an index management page with exactly two parts:
 
 - **Indexed files**: every file's name and real path (monospace, fully readable), with "Open folder", "Copy path" and "Delete" per row; "Open folder" reveals and selects the file in the system file manager (Windows `explorer /select`, macOS `open -R`, Linux `xdg-open` on the parent folder) and only accepts paths that are in the index;
 - **Search & filter**: live search by file name or real path, plus a file-type filter (All / MD / PDF / DOCX / HTML / JSON / TXT …, with counts); the two combine;
