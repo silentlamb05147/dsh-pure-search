@@ -14,7 +14,7 @@ window.__ModuleLoader__.load({
     const module = { exports: {} };
     const exports = module.exports;
     const React = require('react');
-    const { createElement: h, useState, useEffect, useCallback } = React;
+    const { createElement: h, useState, useEffect, useCallback, useMemo } = React;
 
     const API = '/api/pure-search';
     const STYLE_ID = 'dsh-pure-search-style';
@@ -33,6 +33,10 @@ window.__ModuleLoader__.load({
 .ps-list { max-height: 46vh; overflow-y: auto; }
 .ps-list::-webkit-scrollbar { width: 8px; }
 .ps-list::-webkit-scrollbar-thumb { background: rgba(127,127,127,.28); border-radius: 4px; }
+.ps-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.ps-chip { font-size: 11px; padding: 2px 10px; border-radius: 999px; border: 1px solid rgba(127,127,127,.28); background: transparent; color: inherit; cursor: pointer; transition: background .12s ease, border-color .12s ease; }
+.ps-chip:hover { background: rgba(127,127,127,.12); }
+.ps-chip-active { background: rgba(127,127,127,.18); border-color: rgba(127,127,127,.5); }
 `;
 
     function useStyles() {
@@ -107,6 +111,7 @@ window.__ModuleLoader__.load({
       useStyles();
       const [docs, setDocs] = useState([]);
       const [trash, setTrash] = useState([]);
+      const [typeFilter, setTypeFilter] = useState('');
       const [loading, setLoading] = useState(true);
       const [error, setError] = useState('');
       const [busy, setBusy] = useState('');
@@ -194,7 +199,25 @@ window.__ModuleLoader__.load({
         }
       }, [load, trash.length]);
 
-      const docRows = docs.map((doc) => h('div', { key: doc.path, className: 'ps-row' },
+      const typeCounts = useMemo(() => {
+        const counts = new Map();
+        for (const doc of docs) {
+          const key = extOf(doc);
+          counts.set(key, (counts.get(key) || 0) + 1);
+        }
+        return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+      }, [docs]);
+
+      useEffect(() => {
+        if (typeFilter && !typeCounts.some(([key]) => key === typeFilter)) setTypeFilter('');
+      }, [typeFilter, typeCounts]);
+
+      const visibleDocs = useMemo(
+        () => (typeFilter ? docs.filter((doc) => extOf(doc) === typeFilter) : docs),
+        [docs, typeFilter],
+      );
+
+      const docRows = visibleDocs.map((doc) => h('div', { key: doc.path, className: 'ps-row' },
         h('div', { style: styles.ext }, extOf(doc)),
         h('div', { style: styles.grow },
           h('div', { style: styles.name, title: doc.name }, doc.name),
@@ -240,10 +263,26 @@ window.__ModuleLoader__.load({
         h('div', { style: styles.sectionHead },
           h('h4', { style: styles.sectionTitle }, '已索引'),
           h('span', { style: styles.pill }, `${docs.length}`)),
+        typeCounts.length > 1 ? h('div', { className: 'ps-chips' },
+          h('button', {
+            type: 'button',
+            className: `ps-chip${typeFilter === '' ? ' ps-chip-active' : ''}`,
+            onClick: () => setTypeFilter(''),
+          }, `全部 ${docs.length}`),
+          ...typeCounts.map(([key, count]) => h('button', {
+            key,
+            type: 'button',
+            className: `ps-chip${typeFilter === key ? ' ps-chip-active' : ''}`,
+            onClick: () => setTypeFilter(key),
+            title: `只看 ${key} 类型`,
+          }, `${key} ${count}`)),
+        ) : null,
         h('div', { className: 'ps-card' },
           docs.length === 0 && !loading
             ? h('div', { style: styles.empty }, '索引是空的。用 kb_ingest 导入文件后会出现在这里。')
-            : h('div', { className: 'ps-list' }, ...docRows)),
+            : visibleDocs.length === 0
+              ? h('div', { style: styles.empty }, '这个类型下没有文件。')
+              : h('div', { className: 'ps-list' }, ...docRows)),
 
         h('div', { style: styles.sectionHead },
           h('h4', { style: styles.sectionTitle }, '回收站'),
