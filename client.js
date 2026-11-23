@@ -122,6 +122,11 @@ window.__ModuleLoader__.load({
   font-size: 11px; opacity: .48; line-height: 1.45;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+.ps-miss {
+  margin-left: 6px; padding: 1px 6px; border-radius: 999px; font-size: 10px;
+  color: var(--ps-danger); border: 1px solid rgba(229,72,77,.35);
+  vertical-align: 1px; font-weight: 500;
+}
 .ps-meta { font-size: 11px; opacity: .45; }
 .ps-ext {
   width: 34px; height: 34px; flex-shrink: 0; border-radius: 9px;
@@ -374,7 +379,11 @@ window.__ModuleLoader__.load({
       const docRows = visibleDocs.map((doc) => h('div', { key: doc.path, className: 'ps-row' },
         h('div', { className: kindClass(doc.kind) }, extOf(doc)),
         h('div', { className: 'ps-grow' },
-          h('div', { className: 'ps-name', title: doc.name }, doc.name),
+          h('div', { className: 'ps-name', title: doc.name },
+            doc.name,
+            doc.status === 'missing'
+              ? h('span', { className: 'ps-miss', title: '原文件已被移动或删除，索引内容仍在' }, '缺失')
+              : null),
           h('div', { className: 'ps-path', title: doc.path }, doc.path)),
         h('button', {
           type: 'button',

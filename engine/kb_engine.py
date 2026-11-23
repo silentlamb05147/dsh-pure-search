@@ -2098,7 +2098,15 @@ class KBEngine:
                         and previous.get("sha256") == digest
                         and int(previous.get("size") or -1) == int(stat.st_size)
                         and _mtime_same(previous.get("mtime"), mtime)):
-                    skipped += 1
+                    # The file came back at its old path unchanged. Its chunks
+                    # are still there, so only the "missing" marker has to go.
+                    if previous.get("status") == "missing":
+                        previous["status"] = None
+                        updated += 1
+                        changed = True
+                        docs_out.append({"path": display, "chunks": len(by_doc.get(doc_id, []))})
+                    else:
+                        skipped += 1
                     continue
 
                 status = ""
@@ -3079,6 +3087,11 @@ class KBEngine:
                 if (int(entry.get("size") or -1) != int(stat.st_size)
                         or not _mtime_same(entry.get("mtime"), stat.st_mtime)):
                     changed.append(doc_path)
+                elif entry.get("status") == "missing":
+                    # The file is back at the same path with the same bytes:
+                    # drop the stale marker, the stored chunks are still valid.
+                    entry["status"] = None
+                    manifest_dirty = True
             if manifest_dirty:
                 self._save_manifest(root, manifest)
             if changed:
