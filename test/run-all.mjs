@@ -11,6 +11,7 @@ const scripts = [
   'test/section-rerank.mjs',
   'test/chapter.mjs',
   'test/delete.mjs',
+  'test/watch-scope.mjs',
   'test/http.mjs',
 ]
 let failed = 0

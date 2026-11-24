@@ -108,7 +108,7 @@ Recursive ingestion skips hidden directories, `.git`, `node_modules`, `.venv` an
 | `kb_sync` | Incremental sync | `max_files`, `prune` |
 | `kb_clear` | Clear indexes | `scope`: `session` / `workspace` / `all` |
 
-`kb_ask` returns source passages and locations only; no rewriting, summarising or polishing. Every 30 seconds the plugin lazily scans ingested directories: new and changed files are ingested, deleted files are marked `missing`. `kb_delete` moves a document to the **recycle bin**: its chunks leave `chunks.jsonl` for `trash.jsonl`, the manifest entry stays with `status: trashed`, so search, listings and the watcher all skip it; restore it from the settings page or with `kb_delete(restore: true)`. Only “delete permanently” / “empty recycle bin” drops the entry.
+`kb_ask` returns source passages and locations only; no rewriting, summarising or polishing. Every 30 seconds the plugin lazily scans **explicitly subscribed directories**: new and changed files there are ingested, deleted files are marked `missing`. A directory is subscribed only when you pass it to `kb_ingest`; passing a **single file** never subscribes its parent, so indexing one document does not silently pull in its siblings. `kb_delete` moves a document to the **recycle bin**: its chunks leave `chunks.jsonl` for `trash.jsonl`, the manifest entry stays with `status: trashed`, so search, listings and the watcher all skip it; restore it from the settings page or with `kb_delete(restore: true)`. Only “delete permanently” / “empty recycle bin” drops the entry.
 
 ## Settings page
 

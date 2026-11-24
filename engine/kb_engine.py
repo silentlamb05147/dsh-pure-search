@@ -1494,10 +1494,12 @@ class KBEngine:
             if isinstance(doc_id, str) and isinstance(entry, dict):
                 clean[doc_id] = entry
         chunk_cfg = data.get("chunk")
+        watch_dirs = data.get("watch_dirs")
         return {
             "version": MANIFEST_VERSION,
             "docs": clean,
             "chunk": chunk_cfg if isinstance(chunk_cfg, dict) else {},
+            "watch_dirs": [item for item in watch_dirs if isinstance(item, str)] if isinstance(watch_dirs, list) else [],
             "updated_at": data.get("updated_at"),
         }
 
@@ -1933,6 +1935,7 @@ class KBEngine:
             "superseded": len(superseded),
             "superseded_paths": superseded[:20],
             "max_file_mb": _max_file_bytes(params) // (1024 * 1024),
+            "watch_dirs": list(manifest.get("watch_dirs") or []),
             "warnings": self._size_warnings(len(chunks), total_bytes, len(missing), len(docs)),
         }
 
@@ -2201,6 +2204,9 @@ class KBEngine:
             if vectors is None or len(vectors) != len(old_chunks):
                 self._sync_vectors(root, old_chunks, old_chunks, with_embeddings)
 
+        new_watch = self._merge_watch_dirs(manifest.get("watch_dirs"), scope_dirs)
+        watch_changed = new_watch != list(manifest.get("watch_dirs") or [])
+
         if changed:
             ordered_ids = sorted(
                 by_doc.keys(),
@@ -2213,10 +2219,12 @@ class KBEngine:
                 new_chunks.extend(by_doc[doc_id])
             self._sync_vectors(root, old_chunks, new_chunks, with_embeddings)
             self._save_chunks(root, new_chunks)
+        if changed or watch_changed:
             self._save_manifest(root, {
                 "version": MANIFEST_VERSION,
                 "docs": docs_meta,
                 "chunk": chunk_cfg,
+                "watch_dirs": new_watch,
                 "updated_at": _now_iso(),
             })
 
@@ -3053,9 +3061,29 @@ class KBEngine:
                 roots.append(dirpath)
         return roots
 
+    @staticmethod
+    def _merge_watch_dirs(existing: Any, scope_dirs: Sequence[str]) -> List[str]:
+        """Only an explicit directory ingest subscribes a directory.
+
+        A single-file ingest never adds its parent, so dropping one file into a
+        folder does not silently pull in every sibling document.
+        """
+        merged: Dict[str, str] = {}
+        if isinstance(existing, list):
+            for item in existing:
+                if isinstance(item, str) and item.strip():
+                    merged[os.path.normcase(os.path.abspath(item))] = os.path.abspath(item)
+        for item in scope_dirs:
+            merged[os.path.normcase(os.path.abspath(item))] = os.path.abspath(item)
+        return sorted(merged.values(), key=lambda value: value.casefold())
+
     def op_watch(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """One sweep over every index under kb_root: refresh changed docs,
-        flag vanished ones, and ingest new files sitting next to known docs.
+        flag vanished ones, and ingest new files inside subscribed directories.
+
+        Only a directory passed to op_ingest is subscribed (manifest.watch_dirs);
+        a single-file ingest never subscribes its parent, so indexing one file
+        cannot pull in its siblings. Session roots never scan at all.
 
         Called on a timer by the plugin; intentionally synchronous so it shares
         no state with requests (no manifest write races).
@@ -3117,26 +3145,26 @@ class KBEngine:
                     })
                 except Exception as exc:
                     log_event(root, "warn", "watch refresh failed: %s" % exc)
-            # Session roots only refresh documents already indexed there. Scanning
-            # their directories for new files would copy every sibling document of
-            # the working directory into each session index.
+            # Only directories the user explicitly ingested are scanned for new
+            # files. Session roots never scan: that would copy every sibling of
+            # the working directory into the session index.
             is_session_root = (os.sep + "sessions" + os.sep) in os.path.abspath(root)
             new_paths: List[str] = []
             if not is_session_root:
-                dirs = {os.path.dirname(os.path.abspath(path)) for path in known}
-                for directory in list(dirs)[:50]:
+                for directory in list(manifest.get("watch_dirs") or [])[:50]:
+                    if not isinstance(directory, str) or not os.path.isdir(directory):
+                        continue
                     try:
-                        with os.scandir(directory) as entries:
-                            for item in entries:
-                                if not item.is_file():
-                                    continue
-                                if _ext(item.name) not in SUPPORTED_EXTS:
-                                    continue
-                                key = os.path.normcase(os.path.abspath(item.path))
-                                if key not in known:
-                                    new_paths.append(item.path)
+                        found = list(_walk_files(directory, True))
                     except OSError:
                         continue
+                    for item in found[:2000]:
+                        if _ext(item) not in SUPPORTED_EXTS:
+                            continue
+                        key = os.path.normcase(os.path.abspath(item))
+                        if key not in known:
+                            known.add(key)
+                            new_paths.append(item)
                 if new_paths:
                     try:
                         result = self.op_ingest({"kb_root": root, "paths": new_paths,

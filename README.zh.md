@@ -108,7 +108,7 @@
 | `kb_sync` | 增量同步 | `max_files`、`prune` |
 | `kb_clear` | 清理索引 | `scope`：`session` / `workspace` / `all` |
 
-`kb_ask` 仅返回原文段落与出处，不进行改写、摘要或润色。插件每 30 秒对已入库目录执行一次惰性扫描：新增与变更文件自动入库，删除文件标记为 `missing`。`kb_delete` 把文档移入**回收站**：块从 `chunks.jsonl` 搬到 `trash.jsonl`，manifest 保留 `status: trashed` 条目，因此搜索、列表与后台扫描都不会再碰它；在设置页或 `kb_delete(restore: true)` 中可恢复，只有“彻底删除/清空回收站”才真正移除条目。
+`kb_ask` 仅返回原文段落与出处，不进行改写、摘要或润色。插件每 30 秒对**显式订阅的目录**执行一次惰性扫描：这些目录里新增或变更的文件自动入库，删除的文件标记为 `missing`。订阅只在你给 `kb_ingest` 传**目录**时发生；传入**单个文件**不会把它的父目录加入扫描范围，因此单独入库一个文件不会连带同目录的其它文档。`kb_delete` 把文档移入**回收站**：块从 `chunks.jsonl` 搬到 `trash.jsonl`，manifest 保留 `status: trashed` 条目，因此搜索、列表与后台扫描都不会再碰它；在设置页或 `kb_delete(restore: true)` 中可恢复，只有“彻底删除/清空回收站”才真正移除条目。
 
 ## 设置页
 
