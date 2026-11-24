@@ -148,6 +148,12 @@
 
 ## 安装与升级
 
+从 npm 安装（推荐；桌面端插件市场只认 npm 包）：
+
+```powershell
+dsh plugin --profile desktop add dsh-pure-search@1.4.0
+```
+
 从 Git 仓库安装：
 
 ```powershell

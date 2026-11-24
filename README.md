@@ -148,6 +148,12 @@ A synthetic set (50 documents / 200 questions, document level) also measured lit
 
 ## Installation and upgrade
 
+From npm (recommended; the desktop plugin market only installs npm packages):
+
+```powershell
+dsh plugin --profile desktop add dsh-pure-search@1.4.0
+```
+
 From the git repository:
 
 ```powershell
