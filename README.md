@@ -8,7 +8,7 @@ English | [简体中文](README.zh.md)
 
 | Version | License | Runtime |
 |---|---|---|
-| 1.0.0 (2026-11-17) | MIT | DSH 0.2.1-rc.2 / 0.2.2-rc.1; Node.js ≥ 18; Python ≥ 3.9 |
+| 1.4.0 (2026-11-24) | MIT | DSH 0.2.1-rc.2 / 0.2.2-rc.1; Node.js ≥ 18; Python ≥ 3.9 |
 
 Rebuilt from [imaused/dsh-kb-lite](https://github.com/imaused/dsh-kb-lite) (MIT) at 0.4.x. The tool interface and on-disk index format are preserved; DOCX/HTML/JSON parsing, workspace/session layers, chapter detection and reading, section-level reranking, and retrieval-path performance are new. The plugin runs fully offline: no network requests, no model calls, no listening sockets.
 
