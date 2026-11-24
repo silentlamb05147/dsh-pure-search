@@ -201,6 +201,7 @@ window.__ModuleLoader__.load({
   border-top: 1px solid var(--ps-border-soft);
 }
 .ps-empty { padding: 28px 16px; text-align: center; font-size: 12.5px; opacity: .5; line-height: 1.8; }
+.ps-warn { margin: 10px 0 2px; padding: 9px 11px; font-size: 12px; line-height: 1.6; color: #d9a33a; background: rgba(217, 163, 58, .09); border: 1px solid rgba(217, 163, 58, .28); border-radius: 8px; }
 .ps-empty strong { font-weight: 600; opacity: .85; }
 .ps-section { display: flex; align-items: center; gap: 8px; margin-top: 2px; }
 .ps-section-title { font-size: 13px; font-weight: 600; margin: 0; opacity: .88; }
@@ -620,6 +621,9 @@ window.__ModuleLoader__.load({
                 title: '只看原文件已被移动或删除的条目',
               }, `缺失 ${missingCount}`) : null,
             ) : null),
+          docs.length > 1000 ? h('div', { className: 'ps-warn' },
+            `已索引 ${docs.length} 篇：超过 1,000 篇后，这份列表和按名称筛选会明显变慢，`
+            + '建议把用不到的条目移入回收站，或拆到独立索引根。') : null,
           selected.size > 0 ? h('div', { className: 'ps-selbar' },
             h('label', { className: 'ps-sellabel' },
               h('input', {

@@ -1933,12 +1933,22 @@ class KBEngine:
             "superseded": len(superseded),
             "superseded_paths": superseded[:20],
             "max_file_mb": _max_file_bytes(params) // (1024 * 1024),
-            "warnings": self._size_warnings(len(chunks), total_bytes, len(missing)),
+            "warnings": self._size_warnings(len(chunks), total_bytes, len(missing), len(docs)),
         }
 
     @staticmethod
-    def _size_warnings(chunk_count: int, total_bytes: int, orphaned: int) -> List[str]:
+    def _size_warnings(chunk_count: int, total_bytes: int, orphaned: int,
+                       doc_count: int = 0) -> List[str]:
         warnings: List[str] = []
+        if doc_count > 3000:
+            warnings.append("document count is %d (> 3000); the settings-page list and "
+                            "name filtering get noticeably slower, and the 30s watch "
+                            "scan does more work — split into separate knowledge bases"
+                            % doc_count)
+        elif doc_count > 1000:
+            warnings.append("document count is %d (> 1000); queries stay fast, but the "
+                            "settings-page list and name filtering start to drag"
+                            % doc_count)
         if chunk_count > 50000:
             warnings.append("chunk count is %d (> 50k); queries stay usable but "
                             "consider splitting knowledge bases" % chunk_count)
