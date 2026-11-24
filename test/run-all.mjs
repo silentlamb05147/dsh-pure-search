@@ -12,6 +12,7 @@ const scripts = [
   'test/chapter.mjs',
   'test/delete.mjs',
   'test/watch-scope.mjs',
+  'test/features.mjs',
   'test/http.mjs',
 ]
 let failed = 0

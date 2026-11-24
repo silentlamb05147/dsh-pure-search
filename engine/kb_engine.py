@@ -158,6 +158,30 @@ def _module_present(name: str) -> bool:
         return False
 
 
+def _hf_model_dir(model: str) -> str:
+    """HuggingFace hub cache directory for one model id."""
+    base = (os.environ.get("HF_HUB_CACHE")
+            or os.environ.get("HF_HOME")
+            or os.path.join(os.path.expanduser("~"), ".cache", "huggingface"))
+    if os.path.basename(base.rstrip("\\/")) != "hub":
+        base = os.path.join(base, "hub")
+    return os.path.join(base, "models--" + (model or "").replace("/", "--"))
+
+
+def _dir_size(path: str) -> int:
+    total = 0
+    try:
+        for dirpath, _dirnames, filenames in os.walk(path):
+            for name in filenames:
+                try:
+                    total += os.path.getsize(os.path.join(dirpath, name))
+                except OSError:
+                    continue
+    except OSError:
+        return 0
+    return total
+
+
 def _display_path(path: str) -> str:
     """Absolute path with forward slashes (stable across the wire)."""
     try:
@@ -722,6 +746,13 @@ _CHAPTER_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(r"^卷\s*[0-9０-９一二三四五六七八九十百千零〇两]+"),
     re.compile(r"^[0-9]{1,4}\s*[.、．]\s*\S"),
 )
+_EN_CHAPTER_RE = re.compile(
+    r"^(chapter|part|book|appendix|section)\s+([0-9]{1,4}|[ivxlcdm]{1,8})\b",
+    re.IGNORECASE)
+_MD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
+_BOLD_WRAP_RE = re.compile(r"^\*\*(.+?)\*\*$")
+_SPECIAL_CHAPTERS = ("序章", "楔子", "引子", "序幕", "尾声", "后记", "番外",
+                     "前言", "序言", "附录")
 _VOLUME_TAIL_RE = re.compile(r"^[\u4e00-\u9fffA-Za-z（）()·]{2,14}(纪|传|志|载记|表|书)$")
 
 
@@ -731,16 +762,39 @@ def _normalize_heading_text(text: str) -> str:
     return re.sub(r"[\s\u3000:：、，,。.;；·\-—_/\\|（）()\[\]【】《》“”\"'‘’!?！？]+", "", folded)
 
 
-def _detect_chapter(line: str) -> Optional[str]:
-    """Return a chapter-like standalone line (第N章 / 卷N / 谢安传), else None."""
+def _strip_heading_markup(text: str) -> Tuple[str, int]:
+    """Return (text without Markdown/bold markup, heading level)."""
+    match = _MD_HEADING_RE.match(text)
+    if match:
+        return match.group(2).strip(), len(match.group(1))
+    match = _BOLD_WRAP_RE.match(text)
+    if match:
+        return match.group(1).strip(), 0
+    return text, 0
+
+
+def _detect_chapter(line: str, allow_md_h1: bool = True) -> Optional[str]:
+    """Return a chapter-like standalone line (第N章 / 卷N / ## 小节 / Chapter 12)."""
     text = (line or "").strip().lstrip("\ufeff")
     if not text or len(text) > 40:
+        return None
+    text, level = _strip_heading_markup(text)
+    if not text:
+        return None
+    if level == 1 and not allow_md_h1:
         return None
     if any(ch in text for ch in "。！？；"):
         return None
     for pattern in _CHAPTER_PATTERNS:
         if pattern.match(text):
             return text[:120]
+    if _EN_CHAPTER_RE.match(text):
+        return text[:120]
+    if text.startswith(_SPECIAL_CHAPTERS):
+        return text[:120]
+    if level >= 2:
+        # A Markdown section heading is itself a useful chunk heading.
+        return text[:120]
     if (len(text) <= 14 and not any(ch in text for ch in "，、,：:")
             and _VOLUME_TAIL_RE.match(text)):
         return text
@@ -751,8 +805,15 @@ def _chapter_marks(text: str) -> List[Tuple[int, int, str]]:
     """(char_offset, 1-based line, title) for each chapter-like line."""
     marks: List[Tuple[int, int, str]] = []
     offset = 0
+    seen_content = False
     for line_no, line in enumerate(text.splitlines(keepends=True), 1):
-        title = _detect_chapter(line)
+        stripped = line.strip()
+        if stripped:
+            # The document's own first line is its title, not a chapter.
+            title = _detect_chapter(line, allow_md_h1=seen_content)
+            seen_content = True
+        else:
+            title = None
         if title:
             marks.append((offset, line_no, title))
         offset += len(line)
@@ -1131,12 +1192,101 @@ class BM25Index:
         return scores
 
 
-def _snippet(text: str, limit: int = SNIPPET_CHARS) -> str:
+_TERM_SPLIT_RE = re.compile(
+    r"[\s\u3000,，.。;；:：!！?？、()（）\[\]【】\"'“”‘’<>《》/\\|]+")
+_CJK_RUN_RE = re.compile(r"^[\u4e00-\u9fff]+$")
+
+
+def _query_terms(query: str, limit: int = 16) -> List[str]:
+    """Query -> snippet terms: latin/number words plus CJK bigrams."""
+    terms: List[str] = []
+    seen = set()
+
+    def add(value: str) -> None:
+        value = value.strip().casefold()
+        if len(value) < 2 or value in seen:
+            return
+        seen.add(value)
+        terms.append(value)
+
+    for part in _TERM_SPLIT_RE.split(query or ""):
+        part = part.strip()
+        if not part:
+            continue
+        if _CJK_RUN_RE.match(part):
+            for index in range(len(part) - 1):
+                add(part[index:index + 2])
+        else:
+            add(part)
+    return terms[:limit]
+
+
+def _matched_terms(text_lower: str, terms: Sequence[str],
+                   limit: int = 8) -> List[str]:
+    found = [term for term in terms if term in text_lower]
+    found.sort(key=lambda term: (-len(term), term))
+    return found[:limit]
+
+
+_CJK_RUNS_RE = re.compile(r"[\u4e00-\u9fff]+")
+_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{1,}")
+
+
+def _phrase_terms(query: str, text_lower: str,
+                  limit: int = 6) -> List[str]:
+    """Longest query substrings that actually occur in the chunk text.
+
+    Bigram terms ("款窗", "窗口") are too noisy to show as "why it matched";
+    walk each CJK run and take the longest substring present at each position.
+    """
+    found: List[str] = []
+    seen = set()
+
+    def add(value: str) -> None:
+        if len(value) < 2 or value in seen:
+            return
+        seen.add(value)
+        found.append(value)
+
+    for run in _CJK_RUNS_RE.findall(query or ""):
+        position = 0
+        while position < len(run):
+            size = len(run) - position
+            while size >= 2:
+                piece = run[position:position + size]
+                if piece.casefold() in text_lower:
+                    add(piece)
+                    break
+                size -= 1
+            position += size if size >= 2 else 1
+    for word in _WORD_RE.findall(query or ""):
+        if word.casefold() in text_lower:
+            add(word)
+    found.sort(key=lambda term: (-len(term), term))
+    return found[:limit]
+
+
+def _snippet(text: str, limit: int = SNIPPET_CHARS,
+             terms: Sequence[str] = ()) -> str:
     collapsed = re.sub(r"\s+", " ", text or "").strip()
     if len(collapsed) <= limit:
         return collapsed
     if limit <= 1:
         return collapsed[:limit]
+    if terms:
+        lowered = collapsed.casefold()
+        position = None
+        for term in terms:
+            found = lowered.find(term)
+            if found >= 0 and (position is None or found < position):
+                position = found
+        if position is not None:
+            start = max(0, position - limit // 3)
+            end = min(len(collapsed), start + limit)
+            start = max(0, end - limit)
+            prefix = "\u2026" if start > 0 else ""
+            suffix = "\u2026" if end < len(collapsed) else ""
+            return prefix + collapsed[start:end] + suffix
     return collapsed[:limit - 1] + "\u2026"
 
 
@@ -1443,6 +1593,9 @@ class KBEngine:
                 "ping": self.op_ping,
                 "warmup": self.op_warmup,
                 "stats": self.op_stats,
+                "dense_status": self.op_dense_status,
+                "dense_drop": self.op_dense_drop,
+                "reembed": self.op_reembed,
                 "ingest": self.op_ingest,
                 "search": self.op_search,
                 "ask": self.op_ask,
@@ -1938,6 +2091,61 @@ class KBEngine:
             "watch_dirs": list(manifest.get("watch_dirs") or []),
             "warnings": self._size_warnings(len(chunks), total_bytes, len(missing), len(docs)),
         }
+
+    def op_dense_drop(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove the dense vectors of one index root (chunks stay untouched)."""
+        root = _kb_root(params)
+        removed: List[str] = []
+        for name in (VECTORS_NPY, VECTORS_JSON, VECTORS_META):
+            path = _child(root, name)
+            if os.path.isfile(path):
+                try:
+                    os.remove(path)
+                    removed.append(name)
+                except OSError:
+                    continue
+        self._drop_caches(root)
+        return {"kb_root": _display_path(root), "removed": removed}
+
+    def op_dense_status(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Report whether optional dense retrieval can run, without loading a model."""
+        del params
+        import importlib.util as _importlib_util
+        packages = {name: _importlib_util.find_spec(name) is not None
+                    for name in ("numpy", "torch", "sentence_transformers")}
+        cache_dir = _hf_model_dir(DENSE_MODEL)
+        enabled_raw = (os.environ.get("KB_LITE_DENSE") or "").strip().lower()
+        enabled = enabled_raw not in ("0", "false", "off", "no")
+        ready = all(packages.values())
+        return {
+            "model": DENSE_MODEL,
+            "enabled": enabled,
+            "packages": packages,
+            "installed": ready,
+            "cache_dir": cache_dir,
+            "cache_bytes": _dir_size(cache_dir),
+            "cache_present": os.path.isdir(cache_dir),
+            "python": sys.executable,
+            "lazy": bool(getattr(self.dense, "lazy", False)),
+        }
+
+    def op_reembed(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Rebuild dense vectors for the current chunks (no re-parsing)."""
+        root = _kb_root(params)
+        chunks = self._load_chunks(root)
+        if not chunks:
+            return {"vectors": 0, "chunks": 0}
+        if self.dense is None or not getattr(self.dense, "capable", False):
+            raise KBError("dense_unavailable",
+                          "dense backend unavailable: install sentence-transformers")
+        with_embeddings = params.get("with_embeddings")
+        self._sync_vectors(root, list(chunks), list(chunks),
+                           with_embeddings if with_embeddings is not None else "on")
+        meta = self._vector_meta(root)
+        return {"documents": len({chunk.get("doc_id") for chunk in chunks}),
+                "chunks": len(chunks),
+                "vectors": meta.get("count") or 0,
+                "model": meta.get("model")}
 
     @staticmethod
     def _size_warnings(chunk_count: int, total_bytes: int, orphaned: int,
@@ -2629,8 +2837,11 @@ class KBEngine:
 
     def _hit(self, chunk: Dict[str, Any], manifest: Dict[str, Any],
              score: float, matched_by: Sequence[str],
-             detail: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+             detail: Optional[Dict[str, Any]] = None,
+             query: str = "") -> Dict[str, Any]:
         path, title = self._doc_info(manifest, chunk.get("doc_id") or "")
+        text = chunk.get("text") or ""
+        matched_terms = _phrase_terms(query, text.casefold()) if query else []
         hit = {
             "chunk_id": chunk.get("chunk_id"),
             "doc_id": chunk.get("doc_id"),
@@ -2642,7 +2853,8 @@ class KBEngine:
             "page": chunk.get("page"),
             "score": round(float(score), 6),
             "matched_by": list(matched_by),
-            "snippet": _snippet(chunk.get("text") or ""),
+            "matched_terms": matched_terms,
+            "snippet": _snippet(text, terms=matched_terms),
         }
         if detail is not None:
             hit["score_detail"] = detail
@@ -2731,7 +2943,8 @@ class KBEngine:
         for final, index, sources, comp, mult, rule, rec, age_days, superseded in rows:
             chunk = chunks[index]
             hits.append(self._hit(chunk, manifest, final, sources,
-                                  self._detail(comp, mult, rule, final, rec, age_days, superseded)))
+                                  self._detail(comp, mult, rule, final, rec, age_days, superseded),
+                                  query=query))
             hit_indexes.append(index)
         if neighbors is not None:
             for hit, index in zip(hits, hit_indexes):
@@ -3038,6 +3251,7 @@ class KBEngine:
                 "end_line": chunk.get("end_line"),
                 "page": chunk.get("page"),
                 "score": round(final, 6),
+                "matched_terms": _phrase_terms(query, text.casefold()),
                 "score_detail": self._detail(comp, mult, rule, final, rec, age_days, superseded),
                 "text": text,
             })

@@ -8,7 +8,7 @@ English | [简体中文](README.zh.md)
 
 | Version | License | Runtime |
 |---|---|---|
-| 1.4.0 (2026-11-24) | MIT | DSH 0.2.1-rc.2 / 0.2.2-rc.1; Node.js ≥ 18; Python ≥ 3.9 |
+| 1.5.0 (2026-11-24) | MIT | DSH 0.2.1-rc.2 / 0.2.2-rc.1; Node.js ≥ 18; Python ≥ 3.9 |
 
 Rebuilt from [imaused/dsh-kb-lite](https://github.com/imaused/dsh-kb-lite) (MIT) at 0.4.x. The tool interface and on-disk index format are preserved; DOCX/HTML/JSON parsing, workspace/session layers, chapter detection and reading, section-level reranking, and retrieval-path performance are new. The plugin runs fully offline: no network requests, no model calls, no listening sockets.
 
@@ -23,7 +23,8 @@ Rebuilt from [imaused/dsh-kb-lite](https://github.com/imaused/dsh-kb-lite) (MIT)
 | Documents from different projects bleed together | Separate workspace-shared and session-private layers; query session first, fall back explicitly | Scores are never mixed; responses include `layer`, `fell_back`, `fallback_reason` |
 | Citations cannot be checked | Every hit includes document path, title, chapter title and 1-based line range | Jump directly to the source lines |
 | The right document, the wrong passage | Two-stage reranking: order documents first, then rescore passages inside each document without the identifying tokens | Answer-bearing passages in results: 24% → 95% on 100 synthetic questions |
-| Long novels or histories have no structure | Detect chapter lines (`第N章/卷/节/回`, `卷N`, `…纪/传/志`), attach chunks to chapters, read a whole chapter | 438 chapters in 1.33M characters; 130 biographies in the 590k-character *Jinshu* |
+| Long novels or histories have no structure | Detect chapter lines (`第N章/卷/节/回`, `卷N`, `…纪/传/志`), Markdown `#` headings, `Chapter 12`, and markers such as 序章 / 楔子 / 尾声; attach chunks to chapters, read a whole chapter | 438 chapters in 1.33M characters; 130 biographies in the 590k-character *Jinshu* |
+| A hit is returned but the reason is unclear | Every hit carries `matched_terms` (the query words or phrases that actually occur in the passage) and a snippet centred on the first match, instead of a fixed head-of-chunk truncation | Query 退款窗口是几天 → `matched_terms` contains 退款窗口, snippet shows 13 天 |
 | Do not want a plugin that calls out or calls models | Parsing, indexing and retrieval are entirely local | No network, no sockets, no model calls |
 | Worried a DSH upgrade breaks the plugin | Host tools carry all functionality; the only client code is one optional settings page | Removing `client.js` leaves a fully working host-only plugin |
 
@@ -52,7 +53,9 @@ Rebuilt from [imaused/dsh-kb-lite](https://github.com/imaused/dsh-kb-lite) (MIT)
 | Lightweight | 133 KB engine, 48 KB plugin, Python standard library only; no runtime dependencies; install and removal touch a single directory |
 | Low latency | In-process caching; no repeated tokenisation or index rebuilds on the query path |
 | Passage-level ordering | Documents first, passages second, reducing "right document, wrong passage" |
-| Chapter support | Plain-text chapter detection; `kb_get path + chapter` returns a whole chapter with line ranges |
+| Chapter support | Plain-text chapter lines, Markdown `##` headings, `Chapter N`, and 序章 / 楔子 / 尾声 markers; `kb_get path + chapter` returns a whole chapter with line ranges |
+| Hit explanation | `matched_terms` plus a centred snippet on every hit |
+| Optional semantics | Pure BM25 by default; the settings page can install, enable, disable, re-embed or delete the local model |
 | Faithful citations | Returns original text and location; no rewriting, summarising or polishing |
 | Layer isolation | Workspace-shared and session-private layers with explicit fallback markers |
 | Index management | An optional settings page lists each indexed file's name and real path, with a recycle bin (restore / purge); it only edits the index, never the disk |
@@ -73,7 +76,9 @@ Rebuilt from [imaused/dsh-kb-lite](https://github.com/imaused/dsh-kb-lite) (MIT)
 
 **Engine layer (Python ≥ 3.9)** — `engine/kb_engine.py` runs as a separate subprocess and speaks NDJSON over stdin/stdout, one JSON response per request.
 
-**Retrieval** — BM25 over Chinese bigrams; optional dense vectors (`BAAI/bge-small-zh-v1.5`) fused with RRF in hybrid mode; per-call weight overrides, `top_k` and `include_superseded`.
+**Retrieval** — BM25 over Chinese bigrams; optional dense vectors (`BAAI/bge-small-zh-v1.5`) fused with RRF in hybrid mode; per-call weight overrides, `top_k` and `include_superseded`. Dense retrieval is off by default and issues no network calls until it is installed from the settings page, where it can also be disabled or deleted.
+
+**Hit explanation** — every hit returns `matched_terms` (query words or phrases that really occur in the passage; Chinese uses the longest common substring, Latin/digits use words) and a snippet centred on the first match (about 80 characters on each side, marked with `…`).
 
 **Section reranking** — after retrieval, documents are ordered by their best passage; inside each document the tokens used to identify it (title, path) are removed from the query, the remaining terms are rescored against that document's passages, and passages matching the chapter heading receive a boost. A chapter named directly in the query (for example `第140章` or `谢安传`) receives additional weight.
 
@@ -151,7 +156,7 @@ A synthetic set (50 documents / 200 questions, document level) also measured lit
 From npm (recommended; the desktop plugin market only installs npm packages):
 
 ```powershell
-dsh plugin --profile desktop add dsh-pure-search@1.4.0
+dsh plugin --profile desktop add dsh-pure-search@1.5.0
 ```
 
 From the git repository:
@@ -177,9 +182,9 @@ To upgrade, run `add` again and restart DSH; the index format is backward compat
 ## Known limitations
 
 - The first query after a cold start loads the index (about 12 ms; process start about 130 ms). Very large single files build a cache on first query (about 3.3 s for 1.33M characters).
-- Paraphrase recall is 4–6 / 10. Dense retrieval is off by default and requires about 2 GB of extra dependencies.
+- Paraphrase recall is 4–6 / 10. Dense retrieval is off by default; enabling it installs `sentence-transformers` plus a ~95 MB model (about 2 GB of dependencies, mostly PyTorch), and it can be disabled or removed at any time.
 - Scanned PDFs have no text layer and require OCR first.
-- DOCX extraction keeps body text only; tables, images and comments are not preserved. Markdown and DOCX heading styles are not treated as chapters; chapter detection works on plain-text line rules only.
+- DOCX extraction keeps body text only; tables, images and comments are not preserved. DOCX heading styles are not treated as chapters (Markdown `##` headings are), while plain text and Markdown use line rules.
 - JSON is flattened only; nesting deeper than 8 levels is truncated.
 - Divergence from upstream 0.4.x and the merge strategy are documented in [UPSTREAM-DIFF.md](UPSTREAM-DIFF.md).
 

@@ -210,6 +210,21 @@ window.__ModuleLoader__.load({
   font-size: 10px; padding: 1px 5px; border-radius: 5px;
   border: 1px solid var(--ps-border); opacity: .55;
 }
+.ps-dense-head { display: flex; align-items: center; gap: 8px; }
+.ps-dense-head strong { font-size: 13px; font-weight: 600; }
+.ps-dense-body { margin-top: 6px; font-size: 12px; line-height: 1.65; opacity: .68; }
+.ps-dense-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.ps-dense-log {
+  margin: 10px 0 0; padding: 8px 10px; max-height: 120px; overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px; line-height: 1.5; white-space: pre-wrap;
+  background: var(--ps-field); border: 1px solid var(--ps-border-soft); border-radius: 8px;
+}
+.ps-tag {
+  font-size: 10.5px; padding: 1px 7px; border-radius: 999px;
+  border: 1px solid var(--ps-border); opacity: .6;
+}
+.ps-tag-on { color: var(--ps-accent); border-color: currentColor; opacity: .9; }
 `;
 
     function useStyles() {
@@ -271,20 +286,59 @@ window.__ModuleLoader__.load({
       const [error, setError] = useState('');
       const [busy, setBusy] = useState('');
       const [copied, setCopied] = useState('');
+      const [dense, setDense] = useState(null);
+      const [denseBusy, setDenseBusy] = useState('');
 
       const load = useCallback(async () => {
         setLoading(true);
         setError('');
         try {
-          const [docsBody, trashBody] = await Promise.all([getJson('/docs'), getJson('/trash')]);
+          const [docsBody, trashBody, denseBody] = await Promise.all([
+            getJson('/docs'), getJson('/trash'), getJson('/dense').catch(() => null),
+          ]);
           setDocs(Array.isArray(docsBody.docs) ? docsBody.docs : []);
           setTrash(Array.isArray(trashBody.items) ? trashBody.items : []);
+          if (denseBody && denseBody.ok !== false) setDense(denseBody);
         } catch (err) {
           setError(`读取失败：${err && err.message ? err.message : String(err)}`);
         } finally {
           setLoading(false);
         }
       }, []);
+
+      const denseAction = useCallback(async (action) => {
+        setDenseBusy(action);
+        setError('');
+        try {
+          const res = await fetch(`${API}/dense`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ action }),
+          });
+          const body = await res.json();
+          if (body) setDense(body);
+          if (!body || body.ok !== true) {
+            throw new Error((body && body.error) || `HTTP ${res.status}`);
+          }
+        } catch (err) {
+          setError(`语义检索操作失败：${err && err.message ? err.message : String(err)}`);
+        } finally {
+          setDenseBusy('');
+        }
+      }, []);
+
+      useEffect(() => {
+        if (!dense || !dense.job || !dense.job.running) return undefined;
+        const timer = setInterval(async () => {
+          try {
+            const body = await getJson('/dense');
+            if (body && body.ok !== false) setDense(body);
+          } catch {
+            // keep the last known state; the next poll retries
+          }
+        }, 2000);
+        return () => clearInterval(timer);
+      }, [dense]);
 
       useEffect(() => {
         load();
@@ -579,6 +633,56 @@ window.__ModuleLoader__.load({
         showHelp ? h('div', { className: 'ps-help' },
           '本页管理本地文档索引：列出已入库文件，可按名称、类型、缺失状态筛选与批量删除；删除只移入回收站，不碰磁盘原文件；索引与检索均在本机完成，适合集中管理项目文档、资料与笔记。') : null,
         error ? h('div', { className: 'ps-error', role: 'alert' }, error) : null,
+
+        dense ? h('div', { className: 'ps-card ps-dense' },
+          h('div', { className: 'ps-dense-head' },
+            h('strong', null, '语义检索（可选）'),
+            h('span', { className: `ps-tag${dense.enabled ? ' ps-tag-on' : ''}` },
+              dense.enabled ? '已开启' : '默认 BM25')),
+          h('div', { className: 'ps-dense-body' },
+            dense.installed
+              ? '依赖已安装。开启后换说法的问题命中率会明显提升，代价是首次加载约 10 秒、每次查询多 50–300 ms。'
+              : '未安装。默认的 BM25 只认字面词；安装语义检索（sentence-transformers + 约 95 MB 模型）后才能按意思检索。',
+            dense.status && dense.status.cache_bytes
+              ? ` 模型缓存 ${Math.round(dense.status.cache_bytes / 1048576)} MB。` : ''),
+          h('div', { className: 'ps-dense-actions' },
+            !dense.installed ? h('button', {
+              type: 'button',
+              className: 'ps-btn ps-btn-sm',
+              disabled: Boolean(denseBusy) || Boolean(dense.job && dense.job.running),
+              onClick: () => denseAction('install'),
+            }, dense.job && dense.job.running ? '安装中…' : '下载并安装') : null,
+            dense.installed && !dense.enabled ? h('button', {
+              type: 'button',
+              className: 'ps-btn ps-btn-sm',
+              disabled: Boolean(denseBusy),
+              onClick: () => denseAction('enable'),
+            }, '启用') : null,
+            dense.enabled ? h('button', {
+              type: 'button',
+              className: 'ps-btn ps-btn-sm',
+              disabled: Boolean(denseBusy),
+              onClick: () => denseAction('disable'),
+            }, '关闭') : null,
+            dense.enabled ? h('button', {
+              type: 'button',
+              className: 'ps-btn ps-btn-sm',
+              disabled: Boolean(denseBusy),
+              title: '按当前索引重建向量文件',
+              onClick: () => denseAction('reembed'),
+            }, '重建向量') : null,
+            (dense.installed || (dense.status && dense.status.cache_bytes))
+              ? h('button', {
+                type: 'button',
+                className: 'ps-btn ps-btn-sm ps-btn-danger',
+                disabled: Boolean(denseBusy),
+                title: '删除本地模型与向量，随时可重新下载',
+                onClick: () => {
+                  if (window.confirm('删除本地语义模型和已建向量？之后可以重新下载。')) denseAction('delete');
+                },
+              }, '删除模型') : null),
+          dense.error ? h('div', { className: 'ps-error' }, dense.error) : null,
+          dense.job && dense.job.running ? h('pre', { className: 'ps-dense-log' }, dense.log || '等待 pip 输出…') : null) : null,
 
         h('div', { className: 'ps-card' },
           h('div', { className: 'ps-toolbar' },
