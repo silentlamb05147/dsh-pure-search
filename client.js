@@ -225,6 +225,99 @@ window.__ModuleLoader__.load({
   border: 1px solid var(--ps-border); opacity: .6;
 }
 .ps-tag-on { color: var(--ps-accent); border-color: currentColor; opacity: .9; }
+
+/* ---- v1.6 visual refresh --------------------------------------------- */
+.ps-root {
+  --ps-accent: #5b8def;
+  --ps-accent-soft: rgba(91, 141, 239, .14);
+  --ps-accent-line: rgba(91, 141, 239, .42);
+  max-width: 960px; margin: 0 auto; gap: 18px; padding: 4px 2px 40px;
+}
+.ps-hero { display: flex; align-items: flex-start; gap: 14px; }
+.ps-hero-badge {
+  width: 40px; height: 40px; flex: none; border-radius: 13px;
+  display: grid; place-items: center; font-size: 19px; line-height: 1;
+  background: linear-gradient(145deg, rgba(91,141,239,.28), rgba(91,141,239,.05));
+  border: 1px solid rgba(91,141,239,.34);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.09);
+}
+.ps-titles { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.ps-title { font-size: 17px; font-weight: 660; }
+.ps-sub { font-size: 12px; opacity: .55; }
+.ps-hero-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.ps-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.ps-stat {
+  display: flex; flex-direction: column; gap: 1px;
+  padding: 10px 13px; border-radius: 13px;
+  border: 1px solid var(--ps-border); background: var(--ps-surface);
+}
+.ps-stat-num {
+  font-size: 19px; font-weight: 650; letter-spacing: .01em;
+  font-variant-numeric: tabular-nums;
+}
+.ps-stat-label { font-size: 11px; opacity: .5; }
+.ps-stat-warn .ps-stat-num { color: #e0a33c; }
+@media (max-width: 720px) {
+  .ps-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ps-hero-actions .ps-btn { display: none; }
+}
+.ps-card {
+  border-radius: 16px;
+  box-shadow: 0 1px 2px rgba(0,0,0,.05), 0 20px 44px -34px rgba(0,0,0,.4);
+}
+.ps-toolbar { padding: 14px 16px; gap: 12px; }
+.ps-input { padding: 10px 34px; border-radius: 11px; }
+.ps-search-icon { left: 12px; font-size: 14px; }
+.ps-input:focus { box-shadow: 0 0 0 3px var(--ps-accent-soft); border-color: var(--ps-accent-line); }
+.ps-chips { gap: 7px; }
+.ps-chip { padding: 4px 11px; border-radius: 999px; font-size: 11.5px; }
+.ps-chip:hover { border-color: var(--ps-accent-line); }
+.ps-chip-active { background: var(--ps-accent-soft); border-color: var(--ps-accent-line); }
+.ps-chip-danger.ps-chip-active { background: rgba(229,72,77,.14); border-color: rgba(229,72,77,.5); }
+.ps-list { max-height: 52vh; }
+.ps-row { min-height: 56px; padding: 10px 14px; }
+.ps-row:hover { background: rgba(91,141,239,.05); }
+.ps-row-actions { display: flex; align-items: center; gap: 6px; opacity: .7; transition: opacity .12s ease; }
+.ps-row:hover .ps-row-actions, .ps-row:focus-within .ps-row-actions { opacity: 1; }
+.ps-ext { width: 36px; height: 36px; border-radius: 11px; border: 1px solid transparent; font-size: 9.5px; }
+.ps-ext-md { border-color: rgba(63,185,80,.3); }
+.ps-ext-pdf { border-color: rgba(248,81,73,.28); }
+.ps-ext-docx, .ps-ext-doc { border-color: rgba(88,166,255,.28); }
+.ps-ext-html, .ps-ext-htm { border-color: rgba(240,136,62,.28); }
+.ps-ext-json { border-color: rgba(210,153,34,.28); }
+.ps-btn { border-radius: 9px; padding: 5px 12px; }
+.ps-btn-sm { padding: 4px 10px; }
+.ps-btn:hover { background: var(--ps-accent-soft); border-color: var(--ps-accent-line); }
+.ps-btn-danger:hover { background: rgba(229,72,77,.1); border-color: rgba(229,72,77,.5); }
+.ps-icon-btn { width: 30px; height: 30px; border-radius: 9px; }
+.ps-foot { padding: 9px 16px; }
+.ps-empty { padding: 36px 16px; }
+.ps-empty::before {
+  content: '▤'; display: block; font-size: 26px; opacity: .25; margin-bottom: 8px;
+}
+.ps-selbar {
+  position: sticky; bottom: 12px; z-index: 5; border-radius: 12px;
+  border-color: var(--ps-accent-line); background: rgba(127,127,127,.14);
+  backdrop-filter: blur(10px);
+  box-shadow: 0 12px 32px -20px rgba(0,0,0,.6);
+}
+.ps-section { margin-top: 6px; }
+.ps-section-title { font-size: 13.5px; }
+.ps-dense { padding: 14px 16px; }
+.ps-dense-head strong { font-size: 13.5px; }
+.ps-dense-body { opacity: .64; }
+.ps-help { border-radius: 12px; padding: 12px 14px; }
+.ps-warn { border-radius: 11px; }
+.ps-tag { padding: 2px 8px; }
+.ps-pill { font-variant-numeric: tabular-nums; }
+.ps-error { border-radius: 11px; }
+.ps-missing-bar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 14px; border-radius: 12px; font-size: 12.5px;
+  border: 1px dashed rgba(229, 72, 77, .45);
+  background: rgba(229, 72, 77, .06);
+}
+.ps-missing-bar span { flex: 1; min-width: 0; }
 `;
 
     function useStyles() {
@@ -561,26 +654,27 @@ window.__ModuleLoader__.load({
               ? h('span', { className: 'ps-miss', title: '原文件已被移动或删除，索引内容仍在' }, '缺失')
               : null),
           h('div', { className: 'ps-path', title: doc.path }, doc.path)),
-        h('button', {
-          type: 'button',
-          className: 'ps-btn ps-btn-sm',
-          disabled: busy === doc.path || doc.status === 'missing',
-          title: doc.status === 'missing' ? '原文件已不存在' : '在系统文件管理器中显示该文件',
-          onClick: () => openFolder(doc),
-        }, '打开'),
-        h('button', {
-          type: 'button',
-          className: 'ps-btn ps-btn-sm',
-          title: copied === doc.path ? '已复制' : '复制真实路径',
-          onClick: () => copyPath(doc),
-        }, copied === doc.path ? '已复制' : '复制'),
-        h('button', {
-          type: 'button',
-          className: 'ps-btn ps-btn-sm ps-btn-danger',
-          disabled: busy === doc.path,
-          title: '移出索引，放进回收站',
-          onClick: () => trashOne(doc),
-        }, '删除'),
+        h('div', { className: 'ps-row-actions' },
+          h('button', {
+            type: 'button',
+            className: 'ps-btn ps-btn-sm',
+            disabled: busy === doc.path || doc.status === 'missing',
+            title: doc.status === 'missing' ? '原文件已不存在' : '在系统文件管理器中显示该文件',
+            onClick: () => openFolder(doc),
+          }, '打开'),
+          h('button', {
+            type: 'button',
+            className: 'ps-btn ps-btn-sm',
+            title: copied === doc.path ? '已复制' : '复制真实路径',
+            onClick: () => copyPath(doc),
+          }, copied === doc.path ? '已复制' : '复制'),
+          h('button', {
+            type: 'button',
+            className: 'ps-btn ps-btn-sm ps-btn-danger',
+            disabled: busy === doc.path,
+            title: '移出索引，放进回收站',
+            onClick: () => trashOne(doc),
+          }, '删除')),
       ));
 
       const trashRows = trash.map((item) => h('div', { key: `${item.path}:${item.layer || ''}`, className: 'ps-row' },
@@ -590,46 +684,67 @@ window.__ModuleLoader__.load({
           h('div', { className: 'ps-path', title: item.path }, item.path),
           h('div', { className: 'ps-meta' },
             `移入回收站：${formatTime(item.trashed_at)}${item.exists === false ? ' · 原文件已不存在' : ''}`)),
-        h('button', {
-          type: 'button',
-          className: 'ps-btn',
-          disabled: busy === item.path,
-          onClick: () => restore(item),
-        }, '恢复'),
-        h('button', {
-          type: 'button',
-          className: 'ps-btn ps-btn-danger',
-          disabled: busy === item.path,
-          onClick: () => purge(item),
-        }, '彻底删除'),
+        h('div', { className: 'ps-row-actions' },
+          h('button', {
+            type: 'button',
+            className: 'ps-btn',
+            disabled: busy === item.path,
+            onClick: () => restore(item),
+          }, '恢复'),
+          h('button', {
+            type: 'button',
+            className: 'ps-btn ps-btn-danger',
+            disabled: busy === item.path,
+            onClick: () => purge(item),
+          }, '彻底删除')),
       ));
 
       return h('div', { className: 'ps-root' },
-        h('div', { className: 'ps-head' },
-          h('h3', { className: 'ps-title' }, '知识库管理'),
+        h('div', { className: 'ps-hero' },
+          h('div', { className: 'ps-hero-badge', 'aria-hidden': true }, '⌕'),
+          h('div', { className: 'ps-titles' },
+            h('h3', { className: 'ps-title' }, '知识库管理'),
+            h('div', { className: 'ps-sub' },
+              loading
+                ? '读取中…'
+                : `${docs.length} 个文件 · ${typeCounts.length} 种类型 · ${trash.length} 个在回收站`)),
+          h('div', { className: 'ps-hero-actions' },
+            h('button', {
+              type: 'button',
+              className: 'ps-icon-btn',
+              title: showHelp ? '收起说明' : '查看说明',
+              'aria-expanded': showHelp ? 'true' : 'false',
+              onClick: () => setShowHelp((value) => !value),
+            }, showHelp ? '✕' : 'ⓘ'),
+            h('button', {
+              type: 'button',
+              className: 'ps-icon-btn',
+              title: '刷新',
+              disabled: loading,
+              onClick: load,
+            }, '↻'))),
+        h('div', { className: 'ps-stats' },
+          h('div', { className: 'ps-stat' },
+            h('div', { className: 'ps-stat-num' }, String(docs.length)),
+            h('div', { className: 'ps-stat-label' }, '已索引文件')),
+          h('div', { className: 'ps-stat' },
+            h('div', { className: 'ps-stat-num' }, String(typeCounts.length)),
+            h('div', { className: 'ps-stat-label' }, '文件类型')),
+          h('div', { className: `ps-stat${missingCount > 0 ? ' ps-stat-warn' : ''}` },
+            h('div', { className: 'ps-stat-num' }, String(missingCount)),
+            h('div', { className: 'ps-stat-label' }, '缺失源文件')),
+          h('div', { className: 'ps-stat' },
+            h('div', { className: 'ps-stat-num' }, String(trash.length)),
+            h('div', { className: 'ps-stat-label' }, '回收站'))),
+        missingCount > 0 ? h('div', { className: 'ps-missing-bar' },
+          h('span', null, `有 ${missingCount} 个索引的原文件已不存在，索引内容仍可检索。`),
           h('button', {
-            type: 'button',
-            className: 'ps-icon-btn',
-            title: showHelp ? '收起说明' : '查看说明',
-            'aria-expanded': showHelp ? 'true' : 'false',
-            onClick: () => setShowHelp((value) => !value),
-          }, showHelp ? '✕' : 'ⓘ'),
-          h('span', { className: 'ps-pill' }, loading ? '读取中…' : `${docs.length} 个`),
-          h('span', { className: 'ps-spacer' }),
-          missingCount > 0 ? h('button', {
             type: 'button',
             className: 'ps-btn ps-btn-sm ps-btn-danger',
             disabled: busy === '*',
             title: '把所有原文件已不存在的索引移入回收站',
             onClick: clearMissing,
-          }, busy === '*' ? '清理中…' : `清除缺失 ${missingCount}`) : null,
-          h('button', {
-            type: 'button',
-            className: 'ps-icon-btn',
-            title: '刷新',
-            disabled: loading,
-            onClick: load,
-          }, '↻')),
+          }, busy === '*' ? '清理中…' : `移入回收站 ${missingCount}`)) : null,
         showHelp ? h('div', { className: 'ps-help' },
           '本页管理本地文档索引：列出已入库文件，可按名称、类型、缺失状态筛选与批量删除；删除只移入回收站，不碰磁盘原文件；索引与检索均在本机完成，适合集中管理项目文档、资料与笔记。') : null,
         error ? h('div', { className: 'ps-error', role: 'alert' }, error) : null,
