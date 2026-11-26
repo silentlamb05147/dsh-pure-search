@@ -76,6 +76,29 @@ try {
   check('markdown headings become chunk headings',
     headings.includes('退款窗口') && headings.includes('报销流程'), headings)
 
+  const mixed = path.join(base, 'mixed.md')
+  writeDoc(mixed, [
+    '# 混合文档',
+    '',
+    '## 第一部分',
+    '',
+    'Chapter 12: The Return',
+    '',
+    '英文章节行应当单独成块。',
+    '',
+    '卷一 第三章 风起',
+    '',
+    '两层中文章节也应当被识别。',
+    '',
+  ].join('\n'))
+  await call('kb_ingest', { paths: [mixed] })
+  const mixedOutline = await call('kb_outline', { query: 'mixed' })
+  const mixedDoc = (mixedOutline.docs || [])[0] || {}
+  const mixedHeadings = (mixedDoc.headings || []).join('|')
+  check('plain-text chapter lines inside a markdown section are detected',
+    mixedHeadings.includes('Chapter 12: The Return') && mixedHeadings.includes('卷一 第三章 风起'),
+    mixedHeadings)
+
   const search = await call('kb_search', { query: '退款窗口是几天', top_k: 1 })
   const hit = (search.hits || [])[0] || {}
   check('search returns the matching section first',

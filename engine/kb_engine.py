@@ -724,20 +724,40 @@ def chunk_markdown(text: str,
         body = "\n".join(line for _, line in section["lines"])
         if not body.strip():
             continue
-        heading = section["heading"] or title
+        default_heading = section["heading"] or title
+        # A Markdown section may still contain plain-text chapter lines
+        # (`Chapter 12`, `卷一 第三章`, `**第四十章 雨夜**`). Split those too so a
+        # chunk's heading is the chapter it belongs to, not the enclosing `##`.
+        marks = _chapter_marks(body)
+        if marks:
+            bounds: List[Tuple[int, int, str]] = []
+            if marks[0][0] > 0:
+                bounds.append((0, marks[0][0], default_heading))
+            for index, (offset, _, chapter_title) in enumerate(marks):
+                end = marks[index + 1][0] if index + 1 < len(marks) else len(body)
+                bounds.append((offset, end, chapter_title))
+        else:
+            bounds = [(0, len(body), default_heading)]
         newlines = _line_numbers(body)
-        for start, end in split_offsets(body, max_chars, overlap):
-            piece = _span_chunk(body, newlines, section["start"], start, end)
-            if piece is None:
+        for segment_start, segment_end, heading in bounds:
+            if segment_end <= segment_start:
                 continue
-            piece_text, start_line, end_line = piece
-            chunks.append({
-                "heading": heading,
-                "start_line": start_line,
-                "end_line": end_line,
-                "page": None,
-                "text": piece_text,
-            })
+            segment = body[segment_start:segment_end]
+            if not segment.strip():
+                continue
+            for start, end in split_offsets(segment, max_chars, overlap):
+                piece = _span_chunk(body, newlines, section["start"],
+                                    segment_start + start, segment_start + end)
+                if piece is None:
+                    continue
+                piece_text, start_line, end_line = piece
+                chunks.append({
+                    "heading": heading,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "page": None,
+                    "text": piece_text,
+                })
     return title, chunks
 
 
@@ -760,6 +780,20 @@ def _normalize_heading_text(text: str) -> str:
     """Lowercase and drop whitespace/punctuation so "第140章：书名" matches "第140章 书名"."""
     folded = (text or "").casefold()
     return re.sub(r"[\s\u3000:：、，,。.;；·\-—_/\\|（）()\[\]【】《》“”\"'‘’!?！？]+", "", folded)
+
+
+# A section identifier ("第140章 玻璃珠换花魁", "Chapter 12", "谢安传") is a
+# structural name, not loose wording. Only those earn the exact-heading boost;
+# otherwise a generic heading shared by every document ("退款窗口") would lift
+# all of them by the same amount and drown document-level discrimination.
+_CHAPTER_ID_RE = re.compile(
+    r"\d|[章卷回节篇部集]|^(chapter|part|book|appendix|section)|(传|纪|志)$",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_chapter_heading(text: str) -> bool:
+    return bool(text) and bool(_CHAPTER_ID_RE.search(text))
 
 
 def _strip_heading_markup(text: str) -> Tuple[str, int]:
@@ -2504,7 +2538,8 @@ class KBEngine:
             # that is a section identifier, not loose wording, so it outweighs
             # term-frequency noise from other sections of the same book.
             heading_norm = _normalize_heading_text(heading_l)
-            if len(heading_norm) >= 2 and heading_norm in query_norm:
+            if (len(heading_norm) >= 2 and heading_norm in query_norm
+                    and _looks_like_chapter_heading(heading_norm)):
                 boost += 1.2
             if heading_boost_weight > 0 and query_tokens:
                 heading_tokens = [token for token in tokenize(heading_l) if len(token) >= 2]
